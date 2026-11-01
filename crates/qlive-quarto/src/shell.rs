@@ -75,9 +75,11 @@ impl Shell {
 /// which anchor.js uses for the link icons. Verified as the only content difference
 /// between the warm body and Quarto's `<main>`, besides attribute quote style.
 pub fn add_heading_anchors(body: &str) -> String {
+    // Quarto anchors h2–h6 only (`["h2","h3","h4","h5","h6", …].forEach` in its HTML
+    // postprocessor); an h1 is never anchored. Found by the parity corpus.
     static SECTION_HEADING: OnceLock<Regex> = OnceLock::new();
     let re = SECTION_HEADING.get_or_init(|| {
-        Regex::new(r#"<section id="([^"]+)"([^>]*)>(\s*)<h([1-6])>"#).expect("valid regex")
+        Regex::new(r#"<section id="([^"]+)"([^>]*)>(\s*)<h([2-6])>"#).expect("valid regex")
     });
     re.replace_all(body, |caps: &regex::Captures| {
         format!(
@@ -91,9 +93,146 @@ pub fn add_heading_anchors(body: &str) -> String {
     .into_owned()
 }
 
+/// The content of a Quarto page's `<main>`, without the title block — i.e. the part
+/// the warm path produces. `None` if the page has no `<main>`.
+pub fn main_content(page: &str) -> Option<String> {
+    let open = page.find("<main")?;
+    let open_end = open + page[open..].find('>')? + 1;
+    let close = page.rfind("</main>")?;
+    if close < open_end {
+        return None;
+    }
+    static TITLE_BLOCK: OnceLock<Regex> = OnceLock::new();
+    let title = TITLE_BLOCK.get_or_init(|| {
+        Regex::new(r#"(?s)<header id="title-block-header".*?</header>"#).expect("valid regex")
+    });
+    Some(title.replace(&page[open_end..close], "").into_owned())
+}
+
+/// Normalise HTML for comparison: attribute quote style (Deno re-serialises `'` as
+/// `"`) and whitespace between and inside text runs, neither of which a browser
+/// renders differently.
+pub fn normalize_html(html: &str) -> String {
+    static SINGLE_QUOTED: OnceLock<Regex> = OnceLock::new();
+    static SPACE: OnceLock<Regex> = OnceLock::new();
+    static BETWEEN_TAGS: OnceLock<Regex> = OnceLock::new();
+    static BEFORE_CLOSE: OnceLock<Regex> = OnceLock::new();
+    static BOOLEAN: OnceLock<Regex> = OnceLock::new();
+    let quotes = SINGLE_QUOTED.get_or_init(|| Regex::new(r#"=\s*'([^'"]*)'"#).expect("valid regex"));
+    let space = SPACE.get_or_init(|| Regex::new(r"\s+").expect("valid regex"));
+    let between = BETWEEN_TAGS.get_or_init(|| Regex::new(r">\s+<").expect("valid regex"));
+    // `aria-hidden="true" >` and `…="true">` are the same tag.
+    let before_close = BEFORE_CLOSE.get_or_init(|| Regex::new(r"\s+(/?>)").expect("valid regex"));
+    // A bare boolean attribute and `attr=""` are the same attribute; Deno writes the
+    // latter. Applied to both sides, so text containing these words cancels out.
+    let boolean = BOOLEAN.get_or_init(|| {
+        Regex::new(
+            r"\s(allowfullscreen|hidden|disabled|checked|controls|autoplay|loop|muted|defer|async|readonly|required|selected|open|reversed|novalidate|playsinline|default|itemscope)([\s/>])",
+        )
+        .expect("valid regex")
+    });
+    let html = quotes.replace_all(html, r#"="$1""#);
+    let html = space.replace_all(&html, " ");
+    let html = boolean.replace_all(&html, r#" $1=""$2"#);
+    let html = before_close.replace_all(&html, "$1");
+    between.replace_all(&html, "><").trim().to_string()
+}
+
+/// Version every local image by a hash of its bytes: `src="a.png"` becomes
+/// `src="a.png?v=1f2e…"`.
+///
+/// A re-run cell rewrites its figure in place, at the same path. Swapped into the
+/// page under the same URL, the browser shows its cached copy — the new code next to
+/// the old plot. Hashing the contents changes the URL exactly when the image changed,
+/// so unchanged figures stay cached. This is applied to the HTML sent to the
+/// browser, not to the markdown, so the self-check against Quarto is unaffected.
+pub fn version_images(body: &str, root: &std::path::Path) -> String {
+    static IMG_SRC: OnceLock<Regex> = OnceLock::new();
+    let re = IMG_SRC.get_or_init(|| Regex::new(r#"(<img\b[^>]*?\bsrc=")([^"?#]+)(")"#).expect("valid regex"));
+    re.replace_all(body, |caps: &regex::Captures| {
+        let src = &caps[2];
+        let local = !(src.contains("://") || src.starts_with("data:") || src.starts_with('/'));
+        match std::fs::read(root.join(src)) {
+            Ok(bytes) if local => format!("{}{src}?v={:016x}{}", &caps[1], fnv1a(&bytes), &caps[3]),
+            _ => caps[0].to_string(),
+        }
+    })
+    .into_owned()
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("qlive-shell-tests").join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("figs")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_changed_figure_gets_a_new_url_and_an_unchanged_one_keeps_it() {
+        let dir = scratch("versions");
+        let body = r#"<p><img src="figs/a.png" class="img-fluid"></p>"#;
+
+        std::fs::write(dir.join("figs/a.png"), b"first plot").unwrap();
+        let first = version_images(body, &dir);
+        assert_eq!(first, version_images(body, &dir), "same bytes, same URL: stays cached");
+
+        std::fs::write(dir.join("figs/a.png"), b"second plot").unwrap();
+        let second = version_images(body, &dir);
+        assert_ne!(first, second, "new bytes, new URL: the browser must refetch");
+        assert!(second.contains(r#"src="figs/a.png?v="#), "{second}");
+        assert!(second.contains(r#"class="img-fluid""#), "other attributes kept");
+    }
+
+    #[test]
+    fn main_content_drops_the_title_block_and_the_shell() {
+        let content = main_content(PAGE).unwrap();
+        assert!(content.contains("old body"));
+        assert!(!content.contains("title-block-header"));
+        assert!(!content.contains("<script>"));
+    }
+
+    #[test]
+    fn h1_is_never_anchored() {
+        let body = "<section id=\"top\" class=\"level1\"><h1>Top</h1></section>";
+        assert_eq!(add_heading_anchors(body), body);
+    }
+
+    #[test]
+    fn normalisation_ignores_serialisation_only_differences() {
+        assert_eq!(
+            normalize_html(r#"<iframe allowfullscreen></iframe><kbd aria-hidden="true" >K</kbd>"#),
+            normalize_html(r#"<iframe allowfullscreen=""></iframe><kbd aria-hidden="true">K</kbd>"#)
+        );
+    }
+
+    #[test]
+    fn normalisation_ignores_quote_style_and_whitespace_only() {
+        assert_eq!(
+            normalize_html("<i class='icon'></i>\n\n  <p>a   b</p>"),
+            normalize_html("<i class=\"icon\"></i><p>a b</p>")
+        );
+        assert_ne!(normalize_html("<p>a b</p>"), normalize_html("<p>a c</p>"));
+    }
+
+    #[test]
+    fn remote_data_and_missing_images_are_left_alone() {
+        let dir = scratch("untouched");
+        let body = r#"<img src="https://x.org/a.png"><img src="data:image/png;base64,AA"><img src="nope.png">"#;
+        assert_eq!(version_images(body, &dir), body);
+    }
 
     const PAGE: &str = concat!(
         "<html><head><title>T</title></head><body>\n",

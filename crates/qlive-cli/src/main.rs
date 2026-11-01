@@ -8,7 +8,9 @@
 mod bench;
 mod cells;
 mod live;
+mod parity;
 mod preview;
+mod session;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -39,10 +41,15 @@ enum Command {
         #[arg(long)]
         to: Option<String>,
     },
-    /// Live preview: warm Quarto renders pushed into the page, no reload.
+    /// Live preview: warm Quarto renders pushed into the page, no reload; with code
+    /// cells, only the cells that changed run.
     Live {
         /// The .qmd or .md to preview.
         doc: PathBuf,
+        /// Documents whose cells run first, in the same kernel, so their variables are
+        /// available here. Repeat in order: --after ch1.qmd --after ch2.qmd
+        #[arg(long = "after")]
+        after: Vec<PathBuf>,
         /// Port for the preview server.
         #[arg(long, default_value_t = 4444)]
         port: u16,
@@ -57,6 +64,18 @@ enum Command {
         /// Quarto format, e.g. html.
         #[arg(long)]
         to: Option<String>,
+    },
+    /// Compare the warm path with Quarto across a corpus of documents. Documents with
+    /// code cells, local filters or extensions are skipped, never executed.
+    Parity {
+        /// Directory to search for .qmd files, e.g. quarto-cli's tests/docs/smoke-all.
+        dir: PathBuf,
+        /// Only run the first N eligible documents.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Write the markdown report here as well.
+        #[arg(long)]
+        report: Option<PathBuf>,
     },
     /// Measure the latency budget this project is built on.
     Bench {
@@ -81,8 +100,9 @@ enum Command {
 async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Preview { doc, port, to } => preview::run(doc, port, to).await,
-        Command::Live { doc, port } => live::run(doc, port).await,
+        Command::Live { doc, after, port } => live::run(doc, after, port).await,
         Command::Cells { doc, once, to } => cells::run(doc, once, to),
+        Command::Parity { dir, limit, report } => parity::run(dir, limit, report),
         Command::Bench {
             doc,
             iters,

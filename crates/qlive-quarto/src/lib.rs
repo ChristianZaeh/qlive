@@ -5,6 +5,8 @@
 //! patches against it. Anything qlive cannot do confidently comes back here.
 
 pub mod capture;
+pub mod engine;
+pub mod inspect;
 pub mod shell;
 
 pub use capture::Capture;

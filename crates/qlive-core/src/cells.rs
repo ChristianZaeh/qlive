@@ -86,6 +86,26 @@ pub fn assign_keys(cells: &mut [Cell]) {
     }
 }
 
+/// Keys across several documents run in order in one kernel, so that variables
+/// carry from one document to the next. A cell's key covers every code cell before
+/// it in *any* earlier document as well: editing chapter 1 invalidates chapter 2,
+/// whose cells saw different state; editing chapter 2 leaves chapter 1 alone. For a
+/// single document this is exactly [`assign_keys`].
+pub fn chain_keys(docs: &mut [Vec<Cell>]) {
+    let mut cumulative = String::new();
+    for cells in docs.iter_mut() {
+        for cell in cells.iter_mut() {
+            if cell.is_code() {
+                cumulative.push_str(&cell.source);
+                cumulative.push('\n');
+                cell.key = Some(blake3::hash(cumulative.as_bytes()).to_hex().to_string());
+            } else {
+                cell.key = None;
+            }
+        }
+    }
+}
+
 /// The code cells' keys, in document order.
 pub fn code_keys(cells: &[Cell]) -> Vec<String> {
     cells
@@ -355,6 +375,49 @@ mod tests {
         let mut history = live.clone();
         record_executed(&mut history, 0, "a-new-key");
         assert_eq!(history, vec!["a-new-key".to_string()]);
+    }
+
+    const CHAPTER_2: &str = "---\ntitle: Two\n---\n\n```{python}\nz = y + 1\n```\n";
+
+    fn chained(first: &str, second: &str) -> (Vec<String>, Vec<String>) {
+        let mut docs = vec![from_markdown(first), from_markdown(second)];
+        chain_keys(&mut docs);
+        (code_keys(&docs[0]), code_keys(&docs[1]))
+    }
+
+    #[test]
+    fn a_single_document_chain_matches_assign_keys() {
+        let mut docs = vec![from_markdown(DOC)];
+        chain_keys(&mut docs);
+        assert_eq!(code_keys(&docs[0]), code_keys(&from_markdown(DOC)));
+    }
+
+    #[test]
+    fn editing_an_earlier_document_invalidates_the_later_one() {
+        let (a1, b1) = chained(DOC, CHAPTER_2);
+        let (a2, b2) = chained(&DOC.replace("x = 21", "x = 22"), CHAPTER_2);
+        assert_ne!(a1, a2);
+        assert_ne!(b1, b2, "chapter 2 saw different state, so its key must change");
+    }
+
+    #[test]
+    fn editing_a_later_document_leaves_the_earlier_one_alone() {
+        let (a1, b1) = chained(DOC, CHAPTER_2);
+        let (a2, b2) = chained(DOC, &CHAPTER_2.replace("y + 1", "y + 2"));
+        assert_eq!(a1, a2, "chapter 1 must stay cached");
+        assert_ne!(b1, b2);
+    }
+
+    #[test]
+    fn chain_plan_runs_only_the_edited_later_cell() {
+        let (a, b) = chained(DOC, CHAPTER_2);
+        let live: Vec<String> = a.iter().chain(b.iter()).cloned().collect();
+        let (a2, b2) = chained(DOC, &CHAPTER_2.replace("y + 1", "y + 2"));
+        let edited: Vec<String> = a2.iter().chain(b2.iter()).cloned().collect();
+        assert_eq!(
+            plan(&edited, &live),
+            vec![Action::Reuse, Action::Reuse, Action::Execute]
+        );
     }
 
     #[test]

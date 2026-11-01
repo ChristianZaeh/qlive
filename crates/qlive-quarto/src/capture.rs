@@ -45,6 +45,12 @@ pub struct Capture {
 
 /// Render `doc` once with Quarto, capturing its pandoc invocation.
 pub fn capture(quarto: &Path, doc: &Path, to: Option<&str>) -> Result<Capture> {
+    capture_with(quarto, doc, to, &[])
+}
+
+/// [`capture`] with extra `quarto render` arguments — `--no-execute` to render a
+/// notebook whose outputs we produced, without Quarto running any cell.
+pub fn capture_with(quarto: &Path, doc: &Path, to: Option<&str>, extra: &[&str]) -> Result<Capture> {
     let doc = qlive_core::absolute(doc)?;
     let cwd = doc
         .parent()
@@ -67,6 +73,7 @@ pub fn capture(quarto: &Path, doc: &Path, to: Option<&str>) -> Result<Capture> {
     if let Some(fmt) = to {
         cmd.arg("--to").arg(fmt);
     }
+    cmd.args(extra);
     let out = cmd.output().map_err(|e| anyhow!("could not run quarto: {e}"))?;
     if !out.status.success() {
         return Err(anyhow!(

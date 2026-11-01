@@ -6,3 +6,6 @@
 /crates/**/*.html
 /bench-out/
 *.typ.pdf
+
+# Python bytecode from importing the embedded worker
+__pycache__/

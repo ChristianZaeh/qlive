@@ -125,12 +125,159 @@ render and a reload) is used when:
 
 Known gaps:
 
-* **Documents with code cells are cold-only for now.** Joining `qlive cells` to the warm
-  path means reproducing the engine's markdown output, which is the next step.
 * Page scripts that ran at load (anchor.js link icons, code copy buttons, callout
   collapse toggles) do not re-attach to swapped content. Math is re-typeset.
 * The whole body is swapped on each save. At 25–80 ms per render that is fine;
   block-level patches are an optimisation, not a requirement.
+
+### Code cells, and variables shared across documents
+
+With code cells, Quarto never executes anything. qlive holds one kernel, runs only
+the cells whose state could have changed, and:
+
+* **cold:** writes a notebook with our outputs and renders it with
+  `quarto render <doc>.qlive.ipynb --no-execute` (captured), so Quarto renders our
+  results and never runs a cell;
+* **warm:** turns the outputs into the markdown Quarto's Jupyter engine would hand
+  pandoc (`qlive-quarto::engine`, byte-for-byte against a captured render) and runs it
+  through the warm pipeline.
+
+The self-check compares our engine markdown with what Quarto made of our notebook on
+the cold render; any difference turns the warm path off for that document.
+
+**The recommended way to share variables is a master file that includes its
+chapters:**
+
+```
+---
+title: My thesis
+---
+
+{{< include chapters/ch1.qmd >}}
+
+{{< include chapters/ch2.qmd >}}
+```
+
+`qlive live master.qmd` takes the order from the include lines and watches every
+included file, nested ones too. Because Quarto inlines includes into **one document**,
+its chapters share one kernel natively — `quarto render master.qmd` works on its own,
+with no order-dependence problem. qlive's expansion (`qlive-core::includes`) follows
+Quarto's implementation rather than its documentation, including the non-obvious rule
+that **every include path resolves against the master's directory**, nested ones too,
+not against the file containing the include line.
+
+Verified against Quarto's own native render of a master with two chapters in a
+subfolder, Python cells in each, and a nested include with a decoy file of the same
+name next to the includer: what Quarto fed pandoc and what qlive feeds it are
+**byte-identical (615 characters)** apart from cell ids, and both used the file in the
+master's directory. In the browser, editing the doubly-nested include ran no cells and
+patched the page; changing `data` in chapter 1 re-ran chapter 1's cell and chapter 2's
+and showed the new sum, without a reload.
+
+`--after` chains *separate* documents through one kernel instead:
+`qlive live ch2.qmd --after ch1.qmd`. A cell's key covers every code cell
+before it in every earlier document, so editing chapter 1 re-runs chapter 2 and
+editing chapter 2 leaves chapter 1 cached.
+
+> **This makes chapters order-dependent.** Quarto gives every document a fresh
+> kernel — its own `setup.py` runs `%reset` — so `quarto render ch2.qmd` on its own
+> will fail with a `NameError`. A chained book must be built through qlive's notebook
+> path, not by Quarto executing chapters independently.
+
+Verified in a browser with two chapters — chapter 1 defines `data` in a 2-second cell,
+chapter 2 uses it without defining it — counting real executions from a log every
+cell appends to:
+
+| edit | cells that ran | time | reload? |
+|---|---|---:|---|
+| first run | ch1-slow, ch2-print, ch2-plot | 2087 ms kernel | — |
+| prose in chapter 2 | **none** | 54 ms | no |
+| plot cell in chapter 2 | **ch2-plot only** | 87–116 ms | no; new figure shown |
+| `data` in chapter 1 | ch1-slow, ch2-print, ch2-plot | 2116 ms | no; chapter 2 shows `sum of data: 55` |
+| new unrelated cell at the end of chapter 1 | ch1-unrelated, **ch2-print, ch2-plot** | 111 ms | no |
+
+Three bugs only running it found:
+
+* **Quarto's `setup.py` runs `%reset`**, which asks "Proceed (y/[n])?" on stdin. Our
+  worker left stdin enabled, so the kernel waited forever for a keypress. nbclient
+  executes with `allow_stdin=False`, and IPython treats a missing stdin as yes; the
+  worker now does the same for every execution.
+* **Re-run figures showed the old image.** A figure is rewritten at the same path, and
+  the browser served its cached copy after the swap. Image URLs in the pushed HTML are
+  now versioned by a hash of the file's bytes — a new URL exactly when the image
+  changed — and not in the markdown, so the self-check is unaffected.
+* **A borrow conflict** passing the whole cold state while holding a mutable borrow of
+  its worker; fixed by passing only the fields read.
+
+### Which cells run: a dependency graph (M6)
+
+The last row of the table above was the problem with the original rule: adding a cell
+that **nothing uses** re-ran both chapter-2 cells, because a cumulative prefix
+invalidates everything after an edit — across every later chapter, whether or not it
+depends on what changed.
+
+Now each cell runs exactly when its source or something it actually reads changed
+(`qlive-core::deps`):
+
+* **Analysis.** Python's own `ast`, in the kernel worker — parsed, never executed —
+  gives each cell's defined and read names, scope-aware (lambda parameters and
+  comprehension variables stay local; a function body's global reads count as reads
+  of the defining cell). Cached by source, so only edited cells are re-parsed.
+* **Signatures.** A cell's signature hashes its source with the signatures of the
+  cells it reads each name from: a Merkle hash over the dependency graph. Outputs are
+  cached by signature.
+* **The kernel's real state.** For every name the planner tracks which signature's
+  value the kernel holds. If a cell about to run would read the wrong one, its
+  definer re-runs first. That makes **hidden state** and **mutation** correct, which
+  the prefix rule never was: with `x = 1` / `y = x + 1` / `x = 100`, re-running the
+  middle cell restores `x = 1` first; re-running `items.append(…)` restores `items`
+  instead of appending twice. Names only a deleted cell defined are removed from the
+  kernel, so their readers fail as in a fresh run.
+* **Opaque cells** — `exec`, `eval`, `globals()`, star imports, magics — depend on
+  and define everything: they run after anything before them changed, and everything
+  after a running opaque cell runs.
+
+Verified in a real kernel, two chapters, nine cells, counting executions from a log the
+cells write and reading the outputs off the served page:
+
+| edit | cells run | reused | result |
+|---|---:|---:|---|
+| unrelated new cell in chapter 1 (prefix rule: 3) | **1** | 8 | 60 ms |
+| plot cell in chapter 2 | 1 | 8 | 95 ms |
+| `data` in chapter 1 (prefix rule: all 8 after it) | **3** | 6 | its cell and the two readers |
+| `y = x + 1` → `x + 2`, with a later `x = 100` | 2 | 7 | **`y = 3`**, not 102 |
+| `items.append(2)` → `append(3)` | 2 | 7 | **`[1, 3]`**, not `[1, 2, 3]` |
+
+Each run is explained in the log: `ran cell 5 'x = 1': restores 'x' for cell 6`.
+
+Deliberate limits. Method calls count as mutation only for known mutating methods
+(`append`, `sort`, `update`, …) and `inplace=True`, plus assignments into attributes or
+subscripts — counting every call would make `df.head()` a writer of `df` and bring the
+over-invalidation back. Mutation through other methods or function arguments
+(`np.random.shuffle(data)`) and dependencies through files are invisible to name
+analysis; declare them with `#| depends: data, other`. Cells are assumed deterministic.
+
+**The warm render is O(document).** Measured with `qlive bench --sections 400`:
+
+| document | Quarto pipeline, warm | plain pandoc, warm | one block |
+|---|---:|---:|---:|
+| 283 lines | 78 ms | 19 ms | 0.7 ms |
+| 2,803 lines | 782 ms | 229 ms | 0.8 ms |
+
+Linear in size, and dominated by Quarto's filters, not by reloading `main.lua` — a
+six-line document renders in ~20 ms, so the fixed per-render cost is at most that.
+With a master file the whole thesis is *one* document, so every save, prose
+included, pays for the whole thesis: about 1.4 s at 5,000 lines by this line. The fix
+is rendering only what changed, which is hard for exactly one reason: crossref
+numbering, citations and footnotes are document-global.
+
+Not a bottleneck: **the per-cell plumbing.** An empty cell costs 6.3 ms through qlive's
+worker and 6.6 ms talking to the kernel directly with `jupyter_client`; the worker hop
+is ~0.2 ms. The floor is ipykernel itself, so a Rust Jupyter client would save nothing
+measurable.
+
+One-time costs, for completeness: the 2 s cold render on front-matter edits and the
+3.2 s kernel boot per session.
 
 ### `qlive cells`: per-cell execution
 
@@ -239,6 +386,39 @@ working `as` and `dlltool`.
 |---|---|---|
 | **M0** | scaffold: bench + cold render + watch + reload | **done** |
 | **M5a** | per-cell execution (`qlive cells`) | **done**: cell edit runs one cell, prose edit runs none |
+| **M5b** | cells in the live preview, one kernel across chained documents | **done**: prose 54 ms, one cell ~90 ms, no reloads |
+| **M6** | dependency graph instead of prefix invalidation | **done**: a cell runs when its source or what it reads changed; hidden state and mutation handled |
+| **M7** | Quarto's HTML postprocessor on a real DOM | next: 262 of 469 corpus documents still differ, mostly anchors, code-copy, figures |
+
+## Parity against Quarto's test corpus
+
+`qlive parity <dir>` renders each document with Quarto, renders its body through the
+warm path, and compares against Quarto's `<main>`. Documents with code cells, local
+filters or extensions are skipped and never executed. On quarto-cli's
+`tests/docs/smoke-all` at v1.8.27 (469 documents run, 1,163 s):
+
+| bucket | documents | meaning |
+|---|---:|---|
+| pass | 179 | warm output equals Quarto's |
+| **fail** | **262** | **the preview would differ from Quarto's page** |
+| error | 27 | mostly Quarto itself unable to render without executing code; 2 are qlive bugs |
+| fallback | 1 | self-check turned warm off: slower, never wrong |
+
+| cause of failure | documents |
+|---|---:|
+| heading, figure and table anchors | 112 |
+| not yet categorised | 63 |
+| code-copy wrapper | 36 |
+| figure markup | 29 |
+| tables, cross-references, appendix, callouts | 22 |
+
+Nearly all of it is Quarto's Deno-side HTML postprocessor, which runs after pandoc and
+which the warm path does not run. Its rules are small and deterministic — anchors go on
+`h2`–`h6`, `.quarto-figure[id]` and `div[id^=tbl-]`; `data-anchor-id` comes from the
+first `h2` (else `h3`, …) in each `section[class^=level]`; every `pre.sourceCode` is
+wrapped in `div.code-copy-outer-scaffold` with a copy button — but they need DOM
+semantics, which regexes cannot give faithfully. Porting them onto a real DOM, in the
+order of the table, is M7.
 | **M1** | `pandoc lua` worker, whole-document warm passes | **done**: Quarto's own pipeline warm, 78 ms for 283 lines, parity verified |
 | **M2** | warm renders patched into the page, no reload | **done for documents without code cells**: 25–35 ms per save on a small document, ~80 ms expected on a chapter; block-level patching and a 50-doc parity corpus remain |
 | **M3** | VS Code buffer streaming, no save needed | keystroke → pixel under 50 ms p95 |
@@ -327,10 +507,16 @@ section and a callout: after removing exactly three known differences the output
 template, i.e. the page shell — the worker renders a body fragment), heading anchors
 (Quarto's postprocessor) and attribute quote style (Deno's re-serialisation).
 
+> **Correction — that held for one document, not in general.** Quarto's own test
+> corpus says otherwise; see *Parity against Quarto's test corpus* below. The filter
+> chain output matches; Quarto's Deno-side HTML postprocessor does much more than
+> heading anchors, and qlive reproduces little of it yet.
+
 `quarto_pipeline_renders_a_callout_warm` covers the chain end to end — capture, host,
 render twice from one process — and is `#[ignore]`d because it runs a real `quarto
 render`; run it with `cargo test -- --ignored`.
 
-Not done: `main.lua`'s top level re-executes on every render, which is likely part of
-the ~59 ms filter cost and the obvious next optimisation. And the output is a body
-fragment; splicing it into the cold render's shell is M2.
+`main.lua`'s top level re-executes on every render, but that is at most the ~20 ms a
+six-line document takes; the filters' cost grows with the document (see *The warm
+render is O(document)*). The output is a body fragment; splicing it into the cold
+render's shell is M2.
