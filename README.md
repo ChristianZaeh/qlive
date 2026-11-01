@@ -422,7 +422,7 @@ working `as` and `dlltool`.
 | **M5a** | per-cell execution (`qlive cells`) | **done**: cell edit runs one cell, prose edit runs none |
 | **M5b** | cells in the live preview, one kernel across chained documents | **done**: prose 54 ms, one cell ~90 ms, no reloads |
 | **M6** | dependency graph instead of prefix invalidation | **done**: a cell runs when its source or what it reads changed; hidden state and mutation handled |
-| **M7** | Quarto's HTML postprocessor on a real DOM | in progress: anchors, section ids, copy scaffolds, annotations and Bootstrap content classes ported; full-corpus gate still open |
+| **M7** | Quarto's HTML postprocessor on a real DOM | in progress: anchors, section ids, copy scaffolds, annotations, Bootstrap classes and column layout ported; 429/451 corpus documents match |
 
 ## Parity against Quarto's test corpus
 
@@ -442,13 +442,26 @@ are also postprocessed. Column layout, citation processing and writer-option par
 (including table widths) remain open.
 The historical full-corpus results below predate M7 and its stricter comparator.
 
-The [M7 full run](m7-parity-full.md), corpus revision `3977c9d`, measured **403 pass,
-39 fail, 27 error, 1 fallback out of 470**. It predates the embed/nested-cell skip fix;
-some embedded renders attempted kernel startup, so it is not a no-execution run.
-The corrected corpus command skips embeds and executable fences nested in divs,
-and passes `--no-execute` to Quarto. Its [safe 50-document sample](m7-parity-safe-50.md)
-has **44 pass, 6 fail, 0 error**. Eligibility changed, so the samples are not directly
-comparable. The full-corpus parity gate remains open.
+The [M7 full run](m7-parity-full.md) (corpus `3977c9d`, 451 eligible documents, no
+cell executed) measured **429 pass, 12 fail, 10 error**, up from 402 / 37 / 12 the
+same day before four fixes, with no document going from pass to fail:
+
+* pipe-table widths: the pandoc CLI reads with `columns = 72`, the Lua constructor
+  defaults to 80, which shrank every relative width to 72/80 of Quarto's;
+* citations: Quarto lists `citeproc` after `main.lua` in its filters, and the warm
+  path now runs it in that position;
+* column layout: `processColumnElements` from Quarto's Bootstrap finalizer
+  ([`columns.rs`](crates/qlive-quarto/src/postprocess/columns.rs)), which moves
+  margin content and puts ancestors of column elements in the page grid;
+* `PANDOC_SCRIPT_FILE` is set to `main.lua` as pandoc does, so Quarto resolves
+  paths relative to its filters (two former errors).
+
+Of the remaining failures, five lack pandoc's `default-image-extension`, two its
+math method, three a body-side TOC, one an embedded data-URI image, and one a
+malformed fenced div Quarto's reader repairs; the first two groups need the
+captured reader and writer options instead of fixed ones. The errors are Quarto
+failing to render the document (6) or pages without `<main>` (4). The full-corpus
+parity gate remains open.
 
 The initial anchors/copy slice had **29 pass, 17 fail, 4 error** in the first 50
 eligible corpus documents. See [the latest M7 sample report](m7-parity-50.md) for

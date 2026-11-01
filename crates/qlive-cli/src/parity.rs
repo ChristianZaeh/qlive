@@ -176,7 +176,7 @@ fn compare(tools: &Toolchain, doc: &Path, page_file: &Path) -> Result<Outcome> {
         return Ok(Outcome::Fallback);
     }
 
-    let mut worker = LuaWorker::start_quarto(&tools.pandoc, &capture.env, &capture.cwd, &capture.format)?;
+    let mut worker = LuaWorker::start_quarto(&tools.pandoc, &capture.env, &capture.cwd, &capture.format, capture.citeproc)?;
     let rendered = worker.render_quarto(body, &capture.metadata)?;
     if rendered.has_fatal() {
         return Ok(Outcome::Error(format!(
@@ -347,7 +347,7 @@ mod tests {
         let capture = qlive_quarto::capture::capture(&tools.quarto, &path, Some("html"))?;
         let page = std::fs::read_to_string(path.with_extension("html"))?;
         let options = qlive_quarto::postprocess::Options::from_capture(&capture.metadata, &capture.env)?.with_cold_page(&page);
-        let mut worker = LuaWorker::start_quarto(&tools.pandoc, &capture.env, &capture.cwd, &capture.format)?;
+        let mut worker = LuaWorker::start_quarto(&tools.pandoc, &capture.env, &capture.cwd, &capture.format, capture.citeproc)?;
         let initial = worker.render_quarto(frontmatter::split(&source).1, &capture.metadata)?;
         let html = qlive_quarto::postprocess::process(&initial.out, &options);
         let mut document = qlive_quarto::incremental::Document::prepare(&source, &html).expect("eligible fixture");

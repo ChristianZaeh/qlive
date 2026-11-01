@@ -180,7 +180,7 @@ pub fn run(doc: Option<PathBuf>, iters: usize, sections: usize, pandoc_port: u16
 fn quarto_warm(tools: &Toolchain, doc: &Path, iters: usize) -> Result<f64> {
     let cap = qlive_quarto::capture::capture(&tools.quarto, doc, Some("html"))?;
     let mut worker =
-        qlive_pandoc::LuaWorker::start_quarto(&tools.pandoc, &cap.env, &cap.cwd, &cap.format)?;
+        qlive_pandoc::LuaWorker::start_quarto(&tools.pandoc, &cap.env, &cap.cwd, &cap.format, cap.citeproc)?;
 
     let first = worker.render_quarto(&cap.input, &cap.metadata)?;
     if first.has_fatal() {

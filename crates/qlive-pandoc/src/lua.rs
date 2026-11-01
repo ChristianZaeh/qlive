@@ -82,10 +82,11 @@ impl LuaWorker {
         env: &[(String, String)],
         cwd: &Path,
         format: &str,
+        citeproc: bool,
     ) -> Result<Self> {
         let mut worker = Self::spawn(pandoc, env, Some(cwd))?;
         worker
-            .call(json!({"op": "quarto_init", "format": format}))
+            .call(json!({"op": "quarto_init", "format": format, "citeproc": citeproc}))
             .context("loading Quarto's pipeline into the worker")?;
         Ok(worker)
     }
@@ -305,7 +306,7 @@ mod tests {
 
         let cap = qlive_quarto::capture::capture(&tools.quarto, &doc, Some("html")).expect("capture");
         let mut worker =
-            LuaWorker::start_quarto(&tools.pandoc, &cap.env, &cap.cwd, &cap.format).expect("start");
+            LuaWorker::start_quarto(&tools.pandoc, &cap.env, &cap.cwd, &cap.format, cap.citeproc).expect("start");
 
         let first = worker.render_quarto(&cap.input, &cap.metadata).expect("render");
         assert!(first.out.contains("callout-titled"), "no Quarto callout in {:?}", first.out);

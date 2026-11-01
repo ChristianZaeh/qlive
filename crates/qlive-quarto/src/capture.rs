@@ -39,6 +39,8 @@ pub struct Capture {
     pub metadata: String,
     /// The pandoc output format, e.g. `html`.
     pub format: String,
+    /// Whether pandoc runs citeproc after Quarto's filters.
+    pub citeproc: bool,
     /// The capture directory, holding placeholders and results.
     pub dir: PathBuf,
 }
@@ -97,6 +99,7 @@ pub fn capture_with(quarto: &Path, doc: &Path, to: Option<&str>, extra: &[&str])
     let metadata = read_flag_file(&args, "--metadata-file")?;
     let defaults = read_flag_file(&args, "--defaults")?;
     let format = yaml_scalar(&defaults, "to").unwrap_or_else(|| "html".to_string());
+    let citeproc = runs_citeproc(&defaults);
 
     Ok(Capture {
         env,
@@ -104,6 +107,7 @@ pub fn capture_with(quarto: &Path, doc: &Path, to: Option<&str>, extra: &[&str])
         input,
         metadata,
         format,
+        citeproc,
         dir,
     })
 }
@@ -245,6 +249,13 @@ fn yaml_scalar(yaml: &str, key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Quarto lists citeproc as the filter after `main.lua` so its own filters see the
+/// citations first; a plain `citeproc: true` asks pandoc for the same step.
+fn runs_citeproc(defaults: &str) -> bool {
+    defaults.lines().any(|line| line.trim() == "- citeproc")
+        || yaml_scalar(defaults, "citeproc").as_deref() == Some("true")
+}
+
 fn path_str(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
@@ -358,5 +369,12 @@ mod tests {
         assert_eq!(yaml_scalar("standalone: true\nto: html\n", "to").as_deref(), Some("html"));
         assert_eq!(yaml_scalar("to: typst", "to").as_deref(), Some("typst"));
         assert_eq!(yaml_scalar("from: x", "to"), None);
+    }
+
+    #[test]
+    fn reads_citeproc_from_the_filter_list() {
+        assert!(runs_citeproc("filters:\n  - C:/q/main.lua\n  - citeproc\nto: html\n"));
+        assert!(runs_citeproc("citeproc: true\n"));
+        assert!(!runs_citeproc("filters:\n  - C:/q/main.lua\nto: html\n"));
     }
 }

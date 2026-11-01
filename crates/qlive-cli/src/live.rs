@@ -159,6 +159,7 @@ fn cold_plain(tools: &Toolchain, doc: &Path) -> Result<Cold> {
             &capture.env,
             &capture.cwd,
             &capture.format,
+            capture.citeproc,
         )?)
     } else {
         println!("qlive: warm path off: Quarto preprocessed the body in a way qlive does not reproduce");
@@ -210,6 +211,7 @@ fn cold_cells(tools: &Toolchain, doc: &Path, pass: &Pass) -> Result<Cold> {
             &capture.env,
             &capture.cwd,
             &capture.format,
+            capture.citeproc,
         )?),
         Some(diff) => {
             println!("qlive: warm path off: engine markdown differs from Quarto's — {diff}");

@@ -31,7 +31,9 @@ local function quarto_init(req)
 
   -- `pandoc lua` sets none of these; Quarto's filters read all of them.
   FORMAT = req.format or "html"
-  PANDOC_READER_OPTIONS = pandoc.ReaderOptions({})
+  -- The pandoc CLI reads with --columns (default 72); the Lua constructor defaults
+  -- to 80. Pipe-table widths are dash counts over this, so 80 shrinks every column.
+  PANDOC_READER_OPTIONS = pandoc.ReaderOptions({ columns = 72 })
   PANDOC_WRITER_OPTIONS = pandoc.WriterOptions({
     section_divs = true,
     html_math_method = "mathjax",
@@ -45,7 +47,7 @@ local function quarto_init(req)
   dofile(datadir .. "/init.lua")       -- param(), quarto.*, normally loaded via --data-dir
   dofile(filters .. "/qmd-reader.lua") -- defines Reader(); pandoc.read rejects custom readers
 
-  quarto = { main = filters .. "/main.lua" }
+  quarto = { main = filters .. "/main.lua", citeproc = req.citeproc == true }
   return { id = req.id, ok = true }
 end
 
@@ -64,7 +66,13 @@ local function quarto_render(req)
   end
   -- Run in _G: under real pandoc, init.lua and the filter share one global
   -- environment, and _utils.lua (loaded by init.lua) calls globals main.lua defines.
+  -- pandoc sets this to the running filter; init.lua resolves relative paths from it.
+  PANDOC_SCRIPT_FILE = quarto.main
   doc = pandoc.utils.run_lua_filter(doc, quarto.main, _G)
+  -- Quarto's filter list ends with citeproc, after main.lua.
+  if quarto.citeproc then
+    doc = pandoc.utils.citeproc(doc)
+  end
   local out = pandoc.write(doc, FORMAT, PANDOC_WRITER_OPTIONS)
   return { id = req.id, ok = true, out = out, ms = (os.clock() - t0) * 1000 }
 end

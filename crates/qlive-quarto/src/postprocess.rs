@@ -5,11 +5,14 @@
 use kuchiki::{traits::TendrilSink, NodeRef};
 
 mod appendix;
+mod columns;
 pub use appendix::Appendix;
+pub use columns::Columns;
 
 #[derive(Debug, Clone)]
 pub struct Options {
     pub appendix: Option<Appendix>,
+    pub columns: Columns,
     pub bootstrap: bool,
     pub annotations: String,
     pub anchors: bool,
@@ -21,6 +24,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             appendix: None,
+            columns: Columns::default(),
             bootstrap: true,
             annotations: "default".into(),
             anchors: true,
@@ -48,6 +52,7 @@ impl Options {
             if let Some(title) = params["language"]["copy-button-tooltip"].as_str() {
                 options.copy_title = title.to_owned();
             }
+            options.columns = Columns::from_values(&serde_yaml::from_str(metadata)?, &params);
         }
         Ok(options)
     }
@@ -63,6 +68,7 @@ impl Options {
         };
         Ok(Self {
             appendix: Appendix::from_metadata(&value),
+            columns: Columns::from_values(&value, &serde_json::Value::Null),
             bootstrap: !matches!(value["theme"].as_str(), Some("none" | "pandoc")),
             annotations: match &value["code-annotations"] {
                 serde_yaml::Value::Bool(false) => "false".into(),
@@ -426,6 +432,7 @@ pub fn process(body: &str, options: &Options) -> String {
     }
     if options.bootstrap {
         if let Some(appendix) = &options.appendix { appendix.process(&doc); }
+        columns::process(&doc, &options.columns);
     }
     inner_html(&nodes(&doc, "body").remove(0))
 }
