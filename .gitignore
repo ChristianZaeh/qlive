@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# bench and preview leftovers
+/crates/**/*.html
+/bench-out/
+*.typ.pdf

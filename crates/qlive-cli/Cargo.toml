@@ -1,0 +1,21 @@
+[package]
+name = "qlive-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "qlive"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+notify.workspace = true
+tokio.workspace = true
+
+qlive-core.workspace = true
+qlive-pandoc.workspace = true
+qlive-quarto.workspace = true
+qlive-server.workspace = true
+qlive-typst.workspace = true

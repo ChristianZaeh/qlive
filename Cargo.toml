@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/qlive"
+
+[workspace.dependencies]
+anyhow = "1"
+axum = { version = "0.7", features = ["ws"] }
+# "pure" keeps blake3 from building its C/asm SIMD paths, so no C compiler is needed.
+blake3 = { version = "1", features = ["pure"] }
+clap = { version = "4", features = ["derive"] }
+notify = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+# No TLS: qlive only ever talks to pandoc on 127.0.0.1. Dropping it removes rustls,
+# ring, idna and the icu/zerocopy/zmij build scripts from the tree entirely.
+ureq = { version = "2", default-features = false }
+
+qlive-core = { path = "crates/qlive-core" }
+qlive-pandoc = { path = "crates/qlive-pandoc" }
+qlive-quarto = { path = "crates/qlive-quarto" }
+qlive-server = { path = "crates/qlive-server" }
+qlive-typst = { path = "crates/qlive-typst" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
