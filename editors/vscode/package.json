@@ -2,7 +2,7 @@
   "name": "qlive-preview",
   "displayName": "qlive Preview",
   "description": "Quarto preview from unsaved editor buffers",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "publisher": "qlive-local",
   "engines": {
     "vscode": "^1.85.0"

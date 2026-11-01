@@ -79,6 +79,18 @@ fn tail(mut input: impl Read) -> Vec<u8> {
     out
 }
 
+fn failure_message(output: &[u8], errors: &[u8]) -> String {
+    let structured = serde_json::from_slice::<Value>(output).ok()
+        .and_then(|value| value["result"].as_str().filter(|text| !text.trim().is_empty()).map(str::to_owned));
+    let message = structured.unwrap_or_else(|| {
+        let stderr = String::from_utf8_lossy(errors);
+        if !stderr.trim().is_empty() { stderr.trim().to_owned() }
+        else { String::from_utf8_lossy(output).trim().to_owned() }
+    });
+    if message.is_empty() { "The CLI exited without an error explanation. Check its authentication and configuration.".into() }
+    else { message.chars().take(1800).collect() }
+}
+
 pub(super) fn work(store: &Comments, job: Job) {
     let result = execute(store, &job);
     if let Err(error) = result { let _ = store.change(&job.comment.id, "failed", &error.to_string()); }
@@ -121,7 +133,7 @@ fn execute(store: &Comments, job: &Job) -> Result<()> {
     let _ = writer.join();
     let output = out.join().unwrap_or_default();
     let errors = err.join().unwrap_or_default();
-    if !status.success() { bail!("{provider} failed: {}", String::from_utf8_lossy(&errors).chars().take(1800).collect::<String>()); }
+    if !status.success() { bail!("{provider} failed ({status}): {}", failure_message(&output, &errors)); }
     let answer: Value = if provider == "codex" {
         let file = job.folder.join("answer.json");
         if std::fs::metadata(&file)?.len() > 3 * 1024 * 1024 { bail!("Agent response was too large") }
@@ -152,6 +164,13 @@ fn execute(store: &Comments, job: &Job) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn failures_include_structured_stdout_when_stderr_is_empty() {
+        let expired = br#"{"is_error":true,"result":"Failed to authenticate: OAuth session expired and could not be refreshed"}"#;
+        assert_eq!(failure_message(expired, b""), "Failed to authenticate: OAuth session expired and could not be refreshed");
+        assert_eq!(failure_message(b"", b"CLI configuration error\n"), "CLI configuration error");
+        assert_eq!(failure_message(b"plain stdout failure", b""), "plain stdout failure");
+        assert!(!failure_message(b"", b"").is_empty());
+    }
     #[test] fn tags_are_explicit_and_one_agent_per_request() {
         assert_eq!(mention("Explain this").unwrap(), None);
         assert_eq!(mention("Please @claude: fix the paragraph").unwrap().as_deref(), Some("claude"));

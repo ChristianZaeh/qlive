@@ -17,7 +17,7 @@
   const send = el('button', 'Send', panel);
   const error = el('p', '', panel); error.setAttribute('role', 'status');
   const list = el('div', undefined, panel);
-  let anchor, comments = [], sources = [], armed = false, submitting = false, clientId;
+  let anchor, comments = [], sources = [], armed = false, submitting = false, clientId, lastList;
   const normalize = text => text.replace(/\s+/g, ' ').trim();
   async function request(method, body) {
     const response = await fetch('/qlive/comments', {method, headers:{'x-qlive-comment-token':token,'content-type':'application/json'},body:body && JSON.stringify(body)});
@@ -65,18 +65,23 @@
     return matches.length===1 ? matches[0] : undefined;
   }
   function positionPins() {
-    pins.replaceChildren();
+    const previous=new Map([...pins.children].map(pin=>[pin.dataset.commentId,pin]));
     comments.filter(c=>!c.resolved).forEach((comment,i)=>{
       const target=locate(comment); if(!target)return;
       const rect=target.getBoundingClientRect();
-      const pin=el('button',String(i+1),pins);pin.className='qlive-comment-pin';pin.title=comment.message;
+      const pin=previous.get(comment.id)||el('button',undefined,pins);previous.delete(comment.id);
+      pin.dataset.commentId=comment.id;pin.textContent=String(i+1);pin.className='qlive-comment-pin';pin.title=comment.message;
       pin.style.left=Math.max(0,rect.right+window.scrollX-12)+'px';pin.style.top=(rect.top+window.scrollY)+'px';
       pin.onclick=()=>{mode(true);document.getElementById('comment-'+comment.id)?.scrollIntoView({block:'nearest'});};
     });
+    previous.forEach(pin=>pin.remove());
   }
   async function refresh() {
     try {
       const data=await request('GET'); comments=data.comments;sources=data.sources;
+      const fingerprint=JSON.stringify([data,comments.map(comment=>Boolean(locate(comment)))]);
+      if(fingerprint===lastList){positionPins();return;}
+      lastList=fingerprint;
       list.replaceChildren();
       for(const comment of comments){
         const article=el('article',undefined,list);article.id='comment-'+comment.id;

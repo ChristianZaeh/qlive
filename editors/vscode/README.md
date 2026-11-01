@@ -32,7 +32,7 @@ continue. Dependencies use Python name analysis with qlive's documented limits;
 an unparseable cell conservatively blocks later cells.
 
 Build and install the local VSIX with `python editors/vscode/package.py`, then
-`code --install-extension editors/vscode/qlive-preview-0.5.0.vsix --force`.
+`code --install-extension editors/vscode/qlive-preview-0.5.1.vsix --force`.
 
 To route the installed Quarto extension's existing Preview menus and shortcut into
 qlive, run `python editors/vscode/integrate_quarto.py <installed-quarto-extension-dir>`
@@ -106,3 +106,13 @@ node editors/vscode/comment-dom-test.js
 ```
 
 Create `target/comment-dom` first. Visual browser verification remains separate.
+
+To explicitly exercise authenticated providers on disposable documents, set
+`QLIVE_CODEX_EXECUTABLE` / `QLIVE_CLAUDE_EXECUTABLE` and pass `--real` to
+`agent-smoke.js`. This invokes the real services and consumes your provider usage.
+Use `--provider=codex` or `--provider=claude` to test one provider. The harness checks
+the returned proposal and acknowledgements; it does not apply edits in VS Code.
+
+Claude can report `loggedIn: true` even when its next request fails because the
+OAuth session expired. Run its `auth login` command again in that case. Provider
+errors returned on stdout are included in the comment reply.
