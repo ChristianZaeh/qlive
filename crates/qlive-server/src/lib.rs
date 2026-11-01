@@ -111,12 +111,50 @@ pub async fn serve(preview: Preview, port: u16) -> Result<()> {
         .route("/qlive/comments.js", get(comments_js))
         .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
         .route("/*path", get(file))
+        .layer(axum::middleware::from_fn(move |request: axum::extract::Request, next: axum::middleware::Next| local_only(port, request, next)))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Binding to 127.0.0.1 keeps other machines out, but not web pages in the user's own
+/// browser: DNS rebinding reaches the server under a foreign `Host`, and WebSockets
+/// and form posts arrive from any `Origin`. Only this preview's own address passes.
+async fn local_only(port: u16, request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if let Err(refusal) = refuse_foreign(request.headers(), port) {
+        return (StatusCode::FORBIDDEN, refusal).into_response();
+    }
+    next.run(request).await
+}
+
+fn refuse_foreign(headers: &axum::http::HeaderMap, port: u16) -> Result<(), &'static str> {
+    let header = |name| headers.get(name).map(|v| v.to_str().unwrap_or(""));
+    if !header(header::HOST).is_some_and(|host| local_host(host, port)) {
+        return Err("qlive only answers requests for its own address");
+    }
+    // Navigations and same-origin GETs may omit Origin; tools such as the VS Code
+    // extension send none. A browser naming another origin is always refused.
+    if let Some(origin) = header(header::ORIGIN) {
+        if !origin.strip_prefix("http://").is_some_and(|host| local_host(host, port)) {
+            return Err("cross-origin request refused");
+        }
+    }
+    Ok(())
+}
+
+fn local_host(host: &str, port: u16) -> bool {
+    let host = host.to_ascii_lowercase();
+    ["127.0.0.1", "localhost", "[::1]"].iter().any(|name| host == format!("{name}:{port}"))
+}
+
+/// A relative path made only of plain names: no `..`, root, or drive prefix, which
+/// `Path::join` would follow out of the render directory.
+fn confined(rel: &str) -> bool {
+    let rel = Path::new(rel.trim_start_matches('/'));
+    rel.components().all(|part| matches!(part, std::path::Component::Normal(_)))
 }
 
 async fn index(State(state): State<Arc<Preview>>) -> Response {
@@ -156,11 +194,12 @@ fn inject_comments(html: &str, comments: Option<&comments::Comments>) -> String 
 }
 
 async fn file(State(state): State<Arc<Preview>>, UrlPath(rel): UrlPath<String>) -> Response {
-    let full = state.root.join(rel.trim_start_matches('/'));
-    // Never serve outside the render directory.
-    if !full.starts_with(&state.root) {
+    // Never serve outside the render directory. `starts_with` alone is lexical and
+    // lets `root/../x` through, so the path must not contain such components at all.
+    if !confined(&rel) {
         return (StatusCode::FORBIDDEN, "outside the preview root").into_response();
     }
+    let full = state.root.join(rel.trim_start_matches('/'));
     match tokio::fs::read(&full).await {
         Ok(bytes) => {
             let mime = mime_of(&full);
@@ -242,6 +281,27 @@ mod tests {
     #[test]
     fn injects_into_fragments_without_body() {
         assert!(inject("<p>hi</p>").contains("client.js"));
+    }
+
+    #[test]
+    fn only_this_preview_address_is_local() {
+        assert!(local_host("127.0.0.1:4444", 4444));
+        assert!(local_host("LOCALHOST:4444", 4444));
+        assert!(local_host("[::1]:4444", 4444));
+        assert!(!local_host("127.0.0.1:4445", 4444));
+        assert!(!local_host("127.0.0.1", 4444));
+        assert!(!local_host("attacker.example:4444", 4444));
+        assert!(!local_host("127.0.0.1:4444.attacker.example", 4444));
+    }
+
+    #[test]
+    fn paths_stay_inside_the_render_directory() {
+        assert!(confined("page_files/libs/quarto.js"));
+        assert!(confined("/figure.png"));
+        assert!(!confined("../secret.txt"));
+        assert!(!confined("a/../../secret.txt"));
+        assert!(!confined("a\\..\\..\\secret.txt") || !cfg!(windows));
+        assert!(!confined("C:/Windows/win.ini") || !cfg!(windows));
     }
 
     #[test]
