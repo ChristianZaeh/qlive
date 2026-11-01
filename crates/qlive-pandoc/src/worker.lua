@@ -1,26 +1,91 @@
 -- qlive pandoc worker: one JSON object per line, in and out.
+--
+-- Plain ops:   ping, render          (pandoc read + write, no filters)
+-- Quarto ops:  quarto_init, quarto_render
+--
+-- quarto_init loads Quarto's own pipeline into this process once: its datadir
+-- init.lua, its qmd reader, and (per render) its main.lua filter chain. It needs
+-- the environment from a captured `quarto render` (QUARTO_SHARE_PATH,
+-- QUARTO_FILTER_PARAMS, ...), which the Rust side passes when spawning.
+-- After quarto_init the process is in Quarto mode for good: init.lua patches
+-- require, io.input and friends globally.
 local json = pandoc.json
 
-local function render(req)
+local quarto = nil
+
+local function plain_render(req)
   local t0 = os.clock()
-  local ok, result = pcall(function()
-    local doc = pandoc.read(req.text, req.from or "markdown")
-    return pandoc.write(doc, req.to or "html")
-  end)
-  local ms = (os.clock() - t0) * 1000
-  if ok then
-    return { id = req.id, ok = true, out = result, ms = ms }
-  end
-  return { id = req.id, ok = false, err = tostring(result), ms = ms }
+  local doc = pandoc.read(req.text, req.from or "markdown")
+  local out = pandoc.write(doc, req.to or "html")
+  return { id = req.id, ok = true, out = out, ms = (os.clock() - t0) * 1000 }
 end
 
-local function handle(req)
-  if req.op == "ping" then
-    return { id = req.id, ok = true, out = "pong", ms = 0 }
-  elseif req.op == "render" then
-    return render(req)
+local function quarto_init(req)
+  local share = os.getenv("QUARTO_SHARE_PATH")
+  if not share then
+    error("QUARTO_SHARE_PATH is not set; spawn the worker with a captured Quarto env")
   end
-  return { id = req.id, ok = false, err = "unknown op: " .. tostring(req.op) }
+  local datadir = share .. "/pandoc/datadir"
+  local filters = share .. "/filters"
+  package.path = datadir .. "/?.lua;" .. filters .. "/?.lua;" .. package.path
+
+  -- `pandoc lua` sets none of these; Quarto's filters read all of them.
+  FORMAT = req.format or "html"
+  PANDOC_READER_OPTIONS = pandoc.ReaderOptions({})
+  PANDOC_WRITER_OPTIONS = pandoc.WriterOptions({
+    section_divs = true,
+    html_math_method = "mathjax",
+  })
+
+  -- init.lua builds paths from PANDOC_STATE.user_data_dir, which only --data-dir
+  -- sets. The field is read-only, so shadow the global and fall through for the rest.
+  local real_state = PANDOC_STATE
+  PANDOC_STATE = setmetatable({ user_data_dir = datadir }, { __index = real_state })
+
+  dofile(datadir .. "/init.lua")       -- param(), quarto.*, normally loaded via --data-dir
+  dofile(filters .. "/qmd-reader.lua") -- defines Reader(); pandoc.read rejects custom readers
+
+  quarto = { main = filters .. "/main.lua" }
+  return { id = req.id, ok = true }
+end
+
+local function quarto_render(req)
+  if not quarto then
+    error("quarto_init has not run")
+  end
+  local t0 = os.clock()
+  local doc = Reader(req.text, PANDOC_READER_OPTIONS)
+  if req.meta and req.meta ~= "" then
+    -- Quarto passes these with --metadata-file; the title lives here, not in the input.
+    local meta = pandoc.read("---\n" .. req.meta .. "\n---\n", "markdown").meta
+    for k, v in pairs(meta) do
+      doc.meta[k] = v
+    end
+  end
+  -- Run in _G: under real pandoc, init.lua and the filter share one global
+  -- environment, and _utils.lua (loaded by init.lua) calls globals main.lua defines.
+  doc = pandoc.utils.run_lua_filter(doc, quarto.main, _G)
+  local out = pandoc.write(doc, FORMAT, PANDOC_WRITER_OPTIONS)
+  return { id = req.id, ok = true, out = out, ms = (os.clock() - t0) * 1000 }
+end
+
+local handlers = {
+  ping = function(req) return { id = req.id, ok = true, out = "pong", ms = 0 } end,
+  render = plain_render,
+  quarto_init = quarto_init,
+  quarto_render = quarto_render,
+}
+
+local function handle(req)
+  local handler = handlers[req.op]
+  if not handler then
+    return { id = req.id, ok = false, err = "unknown op: " .. tostring(req.op) }
+  end
+  local ok, result = pcall(handler, req)
+  if ok then
+    return result
+  end
+  return { id = req.id, ok = false, err = tostring(result) }
 end
 
 io.stdout:setvbuf("line")

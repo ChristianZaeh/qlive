@@ -11,6 +11,7 @@ repository = "https://example.invalid/qlive"
 [workspace.dependencies]
 anyhow = "1"
 axum = { version = "0.7", features = ["ws"] }
+base64 = "0.22"
 # "pure" keeps blake3 from building its C/asm SIMD paths, so no C compiler is needed.
 blake3 = { version = "1", features = ["pure"] }
 clap = { version = "4", features = ["derive"] }

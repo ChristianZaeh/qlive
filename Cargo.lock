@@ -868,6 +868,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "qlive-core",
+ "qlive-quarto",
  "serde_json",
  "ureq",
 ]
@@ -877,7 +878,9 @@ name = "qlive-quarto"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "qlive-core",
+ "serde_json",
 ]
 
 [[package]]

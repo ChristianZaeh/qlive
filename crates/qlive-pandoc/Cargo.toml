@@ -11,3 +11,4 @@ ureq.workspace = true
 
 [dev-dependencies]
 qlive-core.workspace = true
+qlive-quarto.workspace = true

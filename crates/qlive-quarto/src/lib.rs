@@ -4,6 +4,10 @@
 //! template, theme CSS, JS, resources, filters, bibliography — and then only ships
 //! patches against it. Anything qlive cannot do confidently comes back here.
 
+pub mod capture;
+
+pub use capture::Capture;
+
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;

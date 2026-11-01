@@ -43,15 +43,23 @@ nothing about either tool.
 
 | step | ms |
 |---|---:|
-| quarto render --to html (cold, Deno included) | 2087.7 |
-| pandoc one-shot, whole doc (process start) | 69.6 |
-| pandoc server, whole doc | 23.0 |
+| quarto render --to html (cold, Deno included) | 1935.0 |
+| pandoc one-shot, whole doc (process start) | 71.6 |
+| pandoc server, whole doc | 23.4 |
 | pandoc server, one block | 1.1 |
-| **pandoc lua worker, whole doc** | **19.7** |
+| **pandoc lua worker, whole doc** | **19.3** |
 | **pandoc lua worker, one block** | **0.7** |
-| typst compile, one-shot (process start) | 89.2 |
-| typst watch, edit -> new PDF (end to end) | 137.4 |
-| &nbsp;&nbsp;of which typst reports as compile | **2.6** |
+| **quarto pipeline (reader + filters), warm, whole doc** | **78.3** |
+| typst compile, one-shot (process start) | 835.7 |
+| typst watch, edit -> new PDF (end to end) | 135.8 |
+| &nbsp;&nbsp;of which typst reports as compile | **5.2** |
+
+CPU load was 17% before the run and 10% after. The typst one-shot figure is noisy
+between runs (89 ms in the previous one).
+
+**Quarto's own pipeline renders the whole 283-line document warm in 78 ms**, against
+1935 ms for `quarto render` — 25× — with output that matches Quarto's (see *Capture and
+replay*). Quarto's filters account for ~59 ms of it on top of plain pandoc.
 
 The `pandoc lua` worker beats `pandoc server` on both sizes and, unlike the sandboxed
 server, can host Lua filters — so it is the path forward. Inside Lua, pandoc's own
@@ -192,7 +200,7 @@ working `as` and `dlltool`.
 |---|---|---|
 | **M0** | scaffold: bench + cold render + watch + reload | **done** |
 | **M5a** | per-cell execution (`qlive cells`) | **done**: cell edit runs one cell, prose edit runs none |
-| **M1** | `pandoc lua` worker, whole-document warm passes | **worker done** (0.7 ms/block); filter chain specified, not wired |
+| **M1** | `pandoc lua` worker, whole-document warm passes | **done**: Quarto's own pipeline warm, 78 ms for 283 lines, parity verified |
 | **M2** | block rendering + DOM patching, `data-qlive-id` | p50 under 25 ms; HTML identical to `quarto render` on a 50-doc corpus |
 | **M3** | VS Code buffer streaming, no save needed | keystroke → pixel under 50 ms p95 |
 | **M4** | typst as a library, per-page SVG patches | under 30 ms per edit |
@@ -258,7 +266,32 @@ quote style (Deno's DOM re-serialisation). The callout markup — which only Qua
 filters produce — is identical. Everything outside `<main>` (layout, scripts,
 dependencies) is the postprocessor's and comes from the one cold render.
 
-Speed is not measured cleanly yet: the machine was loaded during the A/B. Interleaved
-under identical load the replay was 5–10× faster than `quarto render` in every round.
-It is still one cold pandoc process per render; moving the same defaults into the
-warm worker is the step to sub-100 ms.
+### Hosted warm (done, verified)
+
+`LuaWorker::start_quarto` loads the captured pipeline into one long-lived `pandoc lua`
+process, and `render_quarto` runs it per edit. Three things had to be worked around,
+each forced by a specific error:
+
+* **`PANDOC_STATE.user_data_dir` is nil** without `--data-dir`, and `init.lua` builds
+  its module paths from it. The field is read-only, so the worker shadows the global
+  with a table that sets it and falls through to the real state for everything else.
+* **`main.lua` must run in `_G`.** `pandoc.utils.run_lua_filter` defaults to its own
+  environment, but `_utils.lua` (loaded by `init.lua`) calls globals that `main.lua`
+  defines — `quarto_assert` was the first to fail. Under real pandoc they share one.
+* **`pandoc.read` rejects custom readers**, so the worker loads `qmd-reader.lua` and
+  calls its `Reader` directly. `FORMAT` and `PANDOC_WRITER_OPTIONS` are set by hand,
+  because `pandoc lua` sets neither.
+
+Parity, checked against Quarto's own `<main>` on a document with a title block, a
+section and a callout: after removing exactly three known differences the output is
+**identical**, character for character. The three are the title block (pandoc's
+template, i.e. the page shell — the worker renders a body fragment), heading anchors
+(Quarto's postprocessor) and attribute quote style (Deno's re-serialisation).
+
+`quarto_pipeline_renders_a_callout_warm` covers the chain end to end — capture, host,
+render twice from one process — and is `#[ignore]`d because it runs a real `quarto
+render`; run it with `cargo test -- --ignored`.
+
+Not done: `main.lua`'s top level re-executes on every render, which is likely part of
+the ~59 ms filter cost and the obvious next optimisation. And the output is a body
+fragment; splicing it into the cold render's shell is M2.

@@ -4,7 +4,7 @@
 //! the premise ("a block costs single-digit milliseconds, Quarto's floor is process
 //! startup") is a reproducible claim rather than a remembered one.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use qlive_core::{Block, BlockKind, Toolchain};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -113,6 +113,12 @@ pub fn run(doc: Option<PathBuf>, iters: usize, sections: usize, pandoc_port: u16
     row("pandoc lua worker, one block", per_block);
     drop(worker);
 
+    // ---- Quarto's own pipeline, warm: reader + main.lua + writer ---------------
+    match quarto_warm(&tools, &doc, iters) {
+        Ok(ms) => row("quarto pipeline (reader + filters), warm, whole doc", ms),
+        Err(e) => println!("| quarto pipeline, warm | n/a — {e} |"),
+    }
+
     // ---- typst ---------------------------------------------------------------
     match &tools.typst {
         Some(typst) => {
@@ -166,6 +172,31 @@ pub fn run(doc: Option<PathBuf>, iters: usize, sections: usize, pandoc_port: u16
     println!("M2 gate: p50 under 25 ms for a prose edit, output identical to quarto render.");
 
     Ok(())
+}
+
+/// Capture one real render, host its pipeline in the worker, and time warm renders of
+/// the same document. Fails loudly on a FATAL from Quarto's filters rather than
+/// timing a broken render.
+fn quarto_warm(tools: &Toolchain, doc: &Path, iters: usize) -> Result<f64> {
+    let cap = qlive_quarto::capture::capture(&tools.quarto, doc, Some("html"))?;
+    let mut worker =
+        qlive_pandoc::LuaWorker::start_quarto(&tools.pandoc, &cap.env, &cap.cwd, &cap.format)?;
+
+    let first = worker.render_quarto(&cap.input, &cap.metadata)?;
+    if first.has_fatal() {
+        return Err(anyhow!(
+            "Quarto's filters reported FATAL: {}",
+            first.diagnostics.join(" | ")
+        ));
+    }
+
+    let mut total = 0.0;
+    for _ in 0..iters {
+        let started = Instant::now();
+        worker.render_quarto(&cap.input, &cap.metadata)?;
+        total += elapsed_ms(started);
+    }
+    Ok(total / iters as f64)
 }
 
 /// Generous budget: typst's own rebuild is single-digit milliseconds, but its first

@@ -37,6 +37,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{channel, Receiver};
 
 const WORKER_LUA: &str = include_str!("worker.lua");
 
@@ -44,8 +45,18 @@ const WORKER_LUA: &str = include_str!("worker.lua");
 #[derive(Debug, Clone)]
 pub struct Rendered {
     pub out: String,
-    /// What the worker measured for `pandoc.read` + `pandoc.write` alone.
+    /// What the worker measured for the pipeline alone (CPU time, inside Lua).
     pub ms: f64,
+    /// Anything pandoc or Quarto's filters wrote to stderr meanwhile. Quarto reports
+    /// FATAL filter errors here, and a cold `pandoc` still exits 0 after one, so this
+    /// is where failure shows up.
+    pub diagnostics: Vec<String>,
+}
+
+impl Rendered {
+    pub fn has_fatal(&self) -> bool {
+        self.diagnostics.iter().any(|line| line.contains("FATAL"))
+    }
 }
 
 /// A long-lived `pandoc lua` process.
@@ -53,35 +64,84 @@ pub struct LuaWorker {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    stderr: Receiver<String>,
     next_id: u64,
 }
 
 impl LuaWorker {
+    /// Plain pandoc: read + write, no filters.
     pub fn start(pandoc: &Path) -> Result<Self> {
+        Self::spawn(pandoc, &[], None)
+    }
+
+    /// Quarto's own pipeline — its reader, `main.lua` and writer options — hosted
+    /// warm. `env` and `cwd` come from a captured real render (`qlive_quarto::capture`);
+    /// without them `init.lua` cannot load.
+    pub fn start_quarto(
+        pandoc: &Path,
+        env: &[(String, String)],
+        cwd: &Path,
+        format: &str,
+    ) -> Result<Self> {
+        let mut worker = Self::spawn(pandoc, env, Some(cwd))?;
+        worker
+            .call(json!({"op": "quarto_init", "format": format}))
+            .context("loading Quarto's pipeline into the worker")?;
+        Ok(worker)
+    }
+
+    fn spawn(pandoc: &Path, env: &[(String, String)], cwd: Option<&Path>) -> Result<Self> {
         let script = script_path()?;
         std::fs::write(&script, WORKER_LUA)
             .with_context(|| format!("writing {}", script.display()))?;
 
-        let mut child = Command::new(pandoc)
+        let mut command = Command::new(pandoc);
+        command
             .arg("lua")
             .arg(&script)
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped());
+        if let Some(dir) = cwd {
+            command.current_dir(dir);
+        }
+        let mut child = command
             .spawn()
             .map_err(|e| anyhow!("could not start `pandoc lua`: {e}"))?;
 
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdout = BufReader::new(child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?);
+        let (tx, stderr) = channel::<String>();
+        if let Some(err) = child.stderr.take() {
+            std::thread::spawn(move || {
+                for line in BufReader::new(err).lines().map_while(Result::ok) {
+                    let _ = tx.send(line);
+                }
+            });
+        }
 
         let mut worker = Self {
             child,
             stdin,
             stdout,
+            stderr,
             next_id: 0,
         };
         worker.ping().context("pandoc lua worker did not answer")?;
         Ok(worker)
+    }
+
+    /// Render through Quarto's pipeline. `meta` is the YAML Quarto passes with
+    /// `--metadata-file`; the output is a body fragment, not a standalone page — the
+    /// page shell comes from the cold render.
+    pub fn render_quarto(&mut self, text: &str, meta: &str) -> Result<Rendered> {
+        let response = self.call(json!({
+            "op": "quarto_render",
+            "text": text,
+            "meta": meta,
+        }))?;
+        Ok(self.rendered(&response))
     }
 
     /// Round-trip check that the worker is alive.
@@ -98,14 +158,29 @@ impl LuaWorker {
             "to": to,
             "text": text,
         }))?;
-        Ok(Rendered {
+        Ok(self.rendered(&response))
+    }
+
+    fn rendered(&self, response: &Value) -> Rendered {
+        Rendered {
             out: response
                 .get("out")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
             ms: response.get("ms").and_then(Value::as_f64).unwrap_or(0.0),
-        })
+            diagnostics: self.drain_stderr(),
+        }
+    }
+
+    fn drain_stderr(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Ok(line) = self.stderr.try_recv() {
+            if !line.trim().is_empty() {
+                lines.push(line);
+            }
+        }
+        lines
     }
 
     fn call(&mut self, mut request: Value) -> Result<Value> {
@@ -135,8 +210,14 @@ impl LuaWorker {
             let err = response
                 .get("err")
                 .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            return Err(anyhow!("pandoc lua worker: {err}"));
+                .unwrap_or("unknown error")
+                .to_string();
+            let stderr = self.drain_stderr();
+            return Err(if stderr.is_empty() {
+                anyhow!("pandoc lua worker: {err}")
+            } else {
+                anyhow!("pandoc lua worker: {err}\nstderr: {}", stderr.join(" | "))
+            });
         }
     }
 }
@@ -203,6 +284,37 @@ mod tests {
         assert!(worker.render("text", "not-a-format", "html").is_err());
         // The worker must still be usable afterwards.
         assert!(worker.render("After.", "markdown", "html").is_ok());
+    }
+
+    /// The whole chain: capture a real render, host Quarto's pipeline warm, and get
+    /// Quarto-only markup back, twice, from one process.
+    #[test]
+    #[ignore = "runs a real quarto render; cargo test -- --ignored"]
+    fn quarto_pipeline_renders_a_callout_warm() {
+        let tools = Toolchain::discover().expect("quarto and pandoc");
+        let dir = std::env::temp_dir().join("qlive-quarto-warm-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("callout.qmd");
+        std::fs::write(
+            &doc,
+            "---\ntitle: Warm\nformat: html\n---\n\n## Heading\n\n\
+             ::: {.callout-note}\nOnly Quarto filters understand this.\n:::\n",
+        )
+        .unwrap();
+
+        let cap = qlive_quarto::capture::capture(&tools.quarto, &doc, Some("html")).expect("capture");
+        let mut worker =
+            LuaWorker::start_quarto(&tools.pandoc, &cap.env, &cap.cwd, &cap.format).expect("start");
+
+        let first = worker.render_quarto(&cap.input, &cap.metadata).expect("render");
+        assert!(first.out.contains("callout-titled"), "no Quarto callout in {:?}", first.out);
+        assert!(!first.has_fatal(), "{:?}", first.diagnostics);
+
+        let edited = cap.input.replace("Only Quarto", "Still only Quarto");
+        let second = worker.render_quarto(&edited, &cap.metadata).expect("second render");
+        assert!(second.out.contains("Still only Quarto"));
+        assert!(second.out.contains("callout-titled"));
     }
 
     #[test]
