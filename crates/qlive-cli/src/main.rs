@@ -142,6 +142,10 @@ fn kernels(doc: Option<PathBuf>, start: bool, stop: bool, json: bool) -> Result<
         let doc = doc.ok_or_else(|| anyhow::anyhow!("--start needs the document"))?;
         let tools = qlive_core::Toolchain::discover()?;
         let chain = session::Chain { docs: vec![doc] };
+        if session::kept_kernel_running(&tools, &chain) {
+            println!("kernel already running");
+            return Ok(());
+        }
         let mut session = session::start_session(&tools, &chain, session::KernelMode::Persistent { fresh: false })?;
         if !session.is_persistent() { anyhow::bail!("the kernel could not be kept running"); }
         let pass = session::run_chain(&mut session, &chain)?;

@@ -74,10 +74,16 @@ fn daemon_state(python: &Path, chain: &Chain) -> Result<PathBuf> {
     hasher.update(qlive_kernel::worker_version().as_bytes());
     for doc in &chain.docs {
         hasher.update(b"\0");
-        hasher.update(doc.to_string_lossy().as_bytes());
+        hasher.update(crate::restart::path_key(doc).as_bytes());
     }
     let dir = kernels_dir().ok_or_else(|| anyhow!("no cache directory"))?;
     Ok(dir.join(format!("{}.json", &hasher.finalize().to_hex()[..24])))
+}
+
+/// Whether a kept kernel for this chain is already running (in use or not).
+pub fn kept_kernel_running(tools: &Toolchain, chain: &Chain) -> bool {
+    let Some(python) = &tools.python else { return false };
+    daemon_state(python, chain).is_ok_and(|state| Kernel::listening(&state))
 }
 
 /// Quarto's kernel setup depends on the same inputs as the restart cache, so it is

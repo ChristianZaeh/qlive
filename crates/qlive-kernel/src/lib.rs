@@ -156,7 +156,7 @@ impl Kernel {
     }
 
     /// Whether the daemon `state` names still accepts connections.
-    fn listening(state: &Path) -> bool {
+    pub fn listening(state: &Path) -> bool {
         let port = std::fs::read(state).ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .and_then(|info| info["port"].as_u64());
@@ -177,9 +177,13 @@ impl Kernel {
         writeln!(writer, "{}", json!({"token": token}))?;
         writer.flush()?;
         let mut hello = String::new();
-        reader.read_line(&mut hello).context("kernel daemon busy or gone")?;
-        if serde_json::from_str::<Value>(&hello).ok().and_then(|v| v["ok"].as_bool()) != Some(true) {
-            return Err(anyhow!("kernel daemon refused the token"));
+        reader.read_line(&mut hello).context("kernel daemon did not answer")?;
+        let hello: Value = serde_json::from_str(&hello).unwrap_or(Value::Null);
+        if hello["ok"].as_bool() != Some(true) {
+            return Err(match hello["err"].as_str() {
+                Some("busy") => anyhow!("the kept kernel is in use by another qlive"),
+                _ => anyhow!("kernel daemon refused the token"),
+            });
         }
         reader.get_ref().set_read_timeout(None)?;
         let (_, stderr) = channel::<String>();

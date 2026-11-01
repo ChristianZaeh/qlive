@@ -458,30 +458,41 @@ def main():
             return
 
 
-def serve_client(conn, st, token):
-    """Authenticate one connection and answer it until it closes; True to shut down."""
+def serve_client(conn, st, token, owner):
+    """Authenticate one connection and, if the kernel is free, answer it until it
+    closes. Returns True when it asked the daemon to shut down."""
     import hmac
 
     rf = conn.makefile("r", encoding="utf-8")
     wf = conn.makefile("w", encoding="utf-8")
     try:
+        conn.settimeout(5)
         try:
             hello = json.loads(rf.readline() or "{}")
             ok = hmac.compare_digest(str(hello.get("token", "")).encode(), token.encode())
         except ValueError:
             ok = False
         if not ok:
+            return False  # a status probe, or a stranger
+        conn.settimeout(None)
+        if not owner.acquire(blocking=False):
+            wf.write(json.dumps({"ok": False, "err": "busy"}) + "\n")
+            wf.flush()
             return False
-        wf.write(json.dumps({"ok": True}) + "\n")
-        wf.flush()
-        for line in rf:
-            resp, stop = handle_line(line, st)
-            if resp is not None:
-                wf.write(json.dumps(resp) + "\n")
-                wf.flush()
-            if stop:
-                return True
-        return False
+        try:
+            wf.write(json.dumps({"ok": True}) + "\n")
+            wf.flush()
+            for line in rf:
+                resp, stop = handle_line(line, st)
+                if resp is not None:
+                    wf.write(json.dumps(resp) + "\n")
+                    wf.flush()
+                if stop:
+                    return True
+            return False
+        finally:
+            st["last_client"] = time.monotonic()
+            owner.release()
     finally:
         for f in (wf, rf):
             try:
@@ -491,50 +502,61 @@ def serve_client(conn, st, token):
 
 
 def serve(state_file, idle_seconds, label):
-    """Daemon mode: the same protocol on a loopback socket, one client at a time, so
-    the kernel and its variables survive the qlive process that started them.
+    """Daemon mode: the same protocol on a loopback socket, so the kernel and its
+    variables survive the qlive process that started them.
 
-    Anyone who can connect could run code, so the first line must carry the 256-bit
-    token written to `state_file`, which lives in the user's own cache directory.
-    Exits, shutting the kernel down, after `idle_seconds` without a client.
+    Anyone who can connect could run code, so a client's first line must carry the
+    256-bit token written to `state_file`, which lives in the user's own cache
+    directory. Connections are always accepted, each on its own thread, so status
+    probes never queue up behind a busy client; only one authenticated client uses
+    the kernel at a time, and a second one is told it is busy. Exits, shutting the
+    kernel down, after `idle_seconds` without an authenticated client.
     """
     import os
     import secrets
     import socket
+    import threading
 
     token = secrets.token_hex(32)
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind(("127.0.0.1", 0))
-    server.listen(1)
-    server.settimeout(idle_seconds)
+    server.listen(16)
+    server.settimeout(1.0)
     temporary = state_file + ".tmp"
     with open(temporary, "w", encoding="utf-8") as f:
         json.dump({"port": server.getsockname()[1], "token": token, "pid": os.getpid(),
                    "label": label, "started": time.time()}, f)
     os.replace(temporary, state_file)
 
-    st = {}
+    st = {"last_client": time.monotonic()}
+    owner = threading.Lock()
+    done = threading.Event()
+
+    def client(conn):
+        # A client that vanishes mid-cell must not take the kernel with it: every
+        # socket error, including the flush when the files close, ends only this
+        # connection.
+        try:
+            if serve_client(conn, st, token, owner):
+                done.set()
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
     try:
-        while True:
+        while not done.is_set():
             try:
                 conn, _ = server.accept()
             except socket.timeout:
-                break
-            conn.settimeout(None)
-            # A client that vanishes mid-cell must not take the kernel with it: every
-            # socket error, including the flush when the files close, ends only
-            # this connection.
-            try:
-                stop = serve_client(conn, st, token)
-            except (OSError, ValueError):
-                stop = False
-            finally:
-                try:
-                    conn.close()
-                except OSError:
-                    pass
-            if stop:
-                break
+                idle = time.monotonic() - st["last_client"]
+                if not owner.locked() and idle > idle_seconds:
+                    break
+                continue
+            threading.Thread(target=client, args=(conn,), daemon=True).start()
     finally:
         if st.get("km") is not None:
             st["km"].shutdown_kernel(now=True)
@@ -555,12 +577,15 @@ def spawn_daemon(state_file, idle_seconds, label):
     common = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
               "stderr": subprocess.DEVNULL, "close_fds": True}
     if sys.platform == "win32":
-        detached, group, breakaway = 0x00000008, 0x00000200, 0x01000000
+        # A hidden console of its own, not none: with DETACHED_PROCESS every console
+        # program the daemon starts, ipykernel included, would open a visible window.
+        no_window, group, breakaway = 0x08000000, 0x00000200, 0x01000000
         try:
-            subprocess.Popen(args, creationflags=detached | group | breakaway, **common)
+            subprocess.Popen(args, creationflags=no_window | group | breakaway, **common)
         except OSError:
-            # Some job objects forbid breakaway; detached still survives a tree kill.
-            subprocess.Popen(args, creationflags=detached | group, **common)
+            # Some job objects forbid breakaway; with this process gone, the daemon
+            # still survives a tree kill.
+            subprocess.Popen(args, creationflags=no_window | group, **common)
     else:
         subprocess.Popen(args, start_new_session=True, **common)
 

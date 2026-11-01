@@ -70,7 +70,7 @@ pub fn key(tools: &Toolchain, doc: &Path, mode: &str, front_matter: Option<&str>
     if let Some(share) = tools.quarto.parent().and_then(Path::parent) {
         part("quarto-version", &std::fs::read(share.join("share").join("version")).unwrap_or_default());
     }
-    part("doc", doc.to_string_lossy().as_bytes());
+    part("doc", path_key(doc).as_bytes());
     part("mode", mode.as_bytes());
     part("profile", std::env::var("QUARTO_PROFILE").unwrap_or_default().as_bytes());
 
@@ -95,6 +95,13 @@ pub fn key(tools: &Toolchain, doc: &Path, mode: &str, front_matter: Option<&str>
         }
     }
     Ok(hasher.finalize().to_hex()[..32].to_owned())
+}
+
+/// A path as a cache key. Windows paths are case-insensitive, and VS Code passes
+/// `c:\…` where a terminal passes `C:\…`; both must find the same entry.
+pub fn path_key(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) { text.to_lowercase() } else { text.into_owned() }
 }
 
 fn stamp(path: &Path) -> String {
