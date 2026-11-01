@@ -222,3 +222,43 @@ Each missing piece surfaces as one precise Lua error, so the set is enumerable �
 layers in six attempts. But that params object is Quarto's internal contract, so the
 robust approach is to **capture a real render's pandoc invocation** and replay it warm,
 rather than reconstruct it by hand.
+
+### Capture and replay (done, verified)
+
+Quarto has this built in: set `QUARTO_CAPTURE_RENDER_COMMAND=<dir>` and `quarto
+render` writes `<dir>/render-command.json` — the pandoc binary, args, cwd and env —
+right before it runs pandoc, copying its temp files beside it. The real invocation is
+simpler than the hand-built probe:
+
+```
+pandoc +RTS -K512m -RTS --defaults <quarto-defaults.yml> <quarto-input.md>
+       --metadata-file <quarto-metadata.yml> --data-dir <quarto>/share/pandoc/datadir
+```
+
+The defaults file carries `from: qmd-reader.lua`, `filters: [main.lua]`, the patched
+template and the writer options; `QUARTO_FILTER_PARAMS` carries 72 keys. Replaying it
+outside Quarto works, with four things learned the hard way:
+
+* **Quarto's process env is required, not just the two vars it passes explicitly.**
+  Without `QUARTO_SHARE_PATH` (and the other `QUARTO_*` from the capture's `ourEnv`),
+  `init.lua` cannot extend its module path and fails on `require('_format')`.
+* **Session files are not captured.** `include-before/after-body` and
+  `notebook-context` live in Quarto's session temp dir, which is deleted
+  unconditionally after every render; the capture only rebases the render's own temp
+  dir. They feed only the page shell, so empty placeholders are fine for the hot path.
+* **Exit code 0 does not mean success.** A FATAL filter error still exits 0 and leaves
+  a stub; check stderr and the output.
+* **The capture dumps the whole process environment** into `ourEnv` — tokens included.
+  Keep only `QUARTO_*` before storing or sharing one.
+
+Parity, on a document with a title block, a section and a callout: the replayed body
+equals the content of Quarto's `<main>` except for heading anchors
+(`class="anchored" data-anchor-id=…`, added by Quarto's postprocessor) and attribute
+quote style (Deno's DOM re-serialisation). The callout markup — which only Quarto's
+filters produce — is identical. Everything outside `<main>` (layout, scripts,
+dependencies) is the postprocessor's and comes from the one cold render.
+
+Speed is not measured cleanly yet: the machine was loaded during the A/B. Interleaved
+under identical load the replay was 5–10× faster than `quarto render` in every round.
+It is still one cold pandoc process per render; moving the same defaults into the
+warm worker is the step to sub-100 ms.
