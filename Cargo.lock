@@ -835,10 +835,12 @@ dependencies = [
  "clap",
  "notify",
  "qlive-core",
+ "qlive-kernel",
  "qlive-pandoc",
  "qlive-quarto",
  "qlive-server",
  "qlive-typst",
+ "serde_json",
  "tokio",
 ]
 
@@ -848,6 +850,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "serde_json",
+]
+
+[[package]]
+name = "qlive-kernel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "qlive-core",
+ "serde_json",
 ]
 
 [[package]]

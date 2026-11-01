@@ -6,6 +6,7 @@
 //! are measured against.
 
 mod bench;
+mod cells;
 mod preview;
 
 use anyhow::Result;
@@ -37,6 +38,17 @@ enum Command {
         #[arg(long)]
         to: Option<String>,
     },
+    /// Execute only the cells that changed, against a kernel that outlives the render.
+    Cells {
+        /// The .qmd with code cells.
+        doc: PathBuf,
+        /// One pass, then exit, instead of watching for saves.
+        #[arg(long)]
+        once: bool,
+        /// Quarto format, e.g. html.
+        #[arg(long)]
+        to: Option<String>,
+    },
     /// Measure the latency budget this project is built on.
     Bench {
         /// Document to measure. A fixture is generated when omitted.
@@ -60,6 +72,7 @@ enum Command {
 async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Preview { doc, port, to } => preview::run(doc, port, to).await,
+        Command::Cells { doc, once, to } => cells::run(doc, once, to),
         Command::Bench {
             doc,
             iters,

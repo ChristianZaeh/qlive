@@ -20,6 +20,8 @@ pub struct Toolchain {
     pub pandoc: PathBuf,
     /// Optional: only the typst output path needs it.
     pub typst: Option<PathBuf>,
+    /// Optional: only documents with code cells need it.
+    pub python: Option<PathBuf>,
 }
 
 impl Toolchain {
@@ -41,10 +43,15 @@ impl Toolchain {
             .or_else(|| tools.as_ref().and_then(|d| find_typst(d)))
             .or_else(|| which("typst"));
 
+        let python = from_env("QLIVE_PYTHON")
+            .or_else(|| from_env("QUARTO_PYTHON"))
+            .or_else(find_python);
+
         Ok(Self {
             quarto,
             pandoc,
             typst,
+            python,
         })
     }
 
@@ -58,8 +65,56 @@ impl Toolchain {
             Some(t) => out.push(("typst".to_string(), first_line(t))),
             None => out.push(("typst".to_string(), "not found".to_string())),
         }
+        match &self.python {
+            Some(p) => out.push(("python".to_string(), first_line(p))),
+            None => out.push(("python".to_string(), "not found".to_string())),
+        }
         out
     }
+}
+
+/// Find a *usable* Python 3.
+///
+/// On Windows, `python.exe` on PATH is often the Microsoft Store alias stub in
+/// `WindowsApps`. Executing it from a non-interactive process fails with
+/// `[WinError 5] Access is denied`, so those are skipped explicitly — this is exactly
+/// how Quarto's own daemon path fails on a machine with only the stub installed.
+fn find_python() -> Option<PathBuf> {
+    for stem in ["python3", "python"] {
+        let name = exe(stem);
+        if let Some(path) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path) {
+                if is_store_alias(&dir) {
+                    continue;
+                }
+                if let Some(found) = existing(&dir.join(&name)) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+
+    // The usual per-user install location, newest first.
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
+    let programs = base.join("Programs").join("Python");
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(&programs)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    candidates.sort();
+    candidates
+        .iter()
+        .rev()
+        .find_map(|dir| existing(&dir.join(exe("python"))))
+}
+
+fn is_store_alias(dir: &Path) -> bool {
+    dir.components().any(|c| {
+        c.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("WindowsApps")
+    })
 }
 
 fn exe(stem: &str) -> String {

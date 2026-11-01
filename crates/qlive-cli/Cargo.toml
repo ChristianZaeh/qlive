@@ -12,9 +12,11 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 notify.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 
 qlive-core.workspace = true
+qlive-kernel.workspace = true
 qlive-pandoc.workspace = true
 qlive-quarto.workspace = true
 qlive-server.workspace = true

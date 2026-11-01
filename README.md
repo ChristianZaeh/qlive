@@ -73,10 +73,43 @@ file watcher inherits this; one built on typst-as-a-library does not.
 ## Commands
 
 ```
-qlive doctor                  which quarto / pandoc / typst were found, and versions
+qlive doctor                  which quarto / pandoc / typst / python were found
 qlive bench [--doc F]         print the latency table for this machine
 qlive preview F [--port N]    cold render once, then re-render on save
+qlive cells F [--once]        execute only the cells that changed
 ```
+
+### `qlive cells`: per-cell execution
+
+Quarto cannot do this. `cache: true` is document-level — editing one cell re-runs every
+cell — and `freeze: auto` re-executes everything when you edit a *paragraph*. Measured
+on a two-cell document where each cell sleeps 2 s, counting actual executions:
+
+| scenario | executed | reused | kernel | render | total | cells that ran |
+|---|---:|---:|---:|---:|---:|---|
+| first pass | 2 | 0 | 4026 ms | 1883 ms | 5911 ms | A, B |
+| last cell edited | **1** | 1 | 2015 ms | 1891 ms | 3908 ms | B only |
+| prose only | **0** | 2 | 0 ms | 1779 ms | **1780 ms** | none |
+| first cell edited | 2 | 0 | 4020 ms | 1894 ms | 5915 ms | A, B |
+
+Quarto on the same document: 10445 ms for the one-cell edit (both cells), 3897 ms for
+the prose edit with `cache: true`, 10289 ms without. The saving grows with how much
+upstream work there is — here cell A is only 2 s.
+
+Image outputs survive: a matplotlib figure arrives as `display_data` and Quarto writes
+it out as `…_files/figure-html/cell-2-output-1.png`, same as it would normally.
+
+**How it stays correct.** A cell's key is `hash(its source + every preceding code
+cell's source)`, so prose never invalidates anything and editing a cell invalidates it
+*and everything after it* — those cells saw different state. Reuse is allowed only for
+the common prefix of the document's keys and the keys this kernel actually executed,
+which is why the kernel is held for the life of the command: skipping a cell is sound
+only while the variables it defined are still live. A cold kernel shares no prefix and
+runs everything.
+
+Known gap: the notebook is assembled by qlive rather than by `quarto convert`, and
+there is no parity test yet against `quarto render doc.qmd` on real documents. Output
+lands next to the source as `doc.qlive.html`.
 
 `qlive preview` is deliberately dumb in M0: it still runs a full `quarto render` per
 save, but the server, the socket and the browser tab survive, so nothing restarts and

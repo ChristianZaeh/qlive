@@ -5,9 +5,11 @@
 //! it are M1/M2 — see the design note.
 
 pub mod blocks;
+pub mod cells;
 pub mod paths;
 pub mod toolchain;
 
 pub use blocks::{dirty_count, hashes, split, Block, BlockKind};
+pub use cells::{Action, Cell, CellKind, CellOutputs};
 pub use paths::absolute;
 pub use toolchain::Toolchain;

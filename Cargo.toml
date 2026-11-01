@@ -23,6 +23,7 @@ tokio = { version = "1", features = ["full"] }
 ureq = { version = "2", default-features = false }
 
 qlive-core = { path = "crates/qlive-core" }
+qlive-kernel = { path = "crates/qlive-kernel" }
 qlive-pandoc = { path = "crates/qlive-pandoc" }
 qlive-quarto = { path = "crates/qlive-quarto" }
 qlive-server = { path = "crates/qlive-server" }

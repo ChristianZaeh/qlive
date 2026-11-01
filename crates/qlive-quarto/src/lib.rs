@@ -17,8 +17,21 @@ pub struct ColdRender {
     pub duration: Duration,
 }
 
+/// Render a notebook that already carries its outputs, without touching a kernel.
+///
+/// This is the seam the per-cell executor is built on: we own execution, Quarto owns
+/// markdown, filters, themes and formats. Measured at ~1.9 s with zero cells executed,
+/// against ~6.4 s when Quarto runs them itself.
+pub fn render_no_execute(quarto: &Path, doc: &Path, to: Option<&str>) -> Result<ColdRender> {
+    render_with(quarto, doc, to, &["--no-execute"])
+}
+
 /// Run `quarto render <doc> [--to <fmt>]` in the document's own directory.
 pub fn render(quarto: &Path, doc: &Path, to: Option<&str>) -> Result<ColdRender> {
+    render_with(quarto, doc, to, &[])
+}
+
+fn render_with(quarto: &Path, doc: &Path, to: Option<&str>, extra: &[&str]) -> Result<ColdRender> {
     // Not canonicalize(): on Windows that yields a `\\?\` path, which Quarto's Deno
     // runtime cannot stat.
     let doc = qlive_core::absolute(doc)?;
@@ -28,6 +41,7 @@ pub fn render(quarto: &Path, doc: &Path, to: Option<&str>) -> Result<ColdRender>
     if let Some(fmt) = to {
         cmd.arg("--to").arg(fmt);
     }
+    cmd.args(extra);
     if let Some(dir) = doc.parent() {
         cmd.current_dir(dir);
     }
