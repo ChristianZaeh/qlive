@@ -95,6 +95,7 @@ pub async fn run(doc: PathBuf, after: Vec<PathBuf>, port: u16) -> Result<()> {
         .to_string_lossy()
         .to_string();
     let mut preview = Preview::new(root, entry);
+    preview.enable_comments(chain.target())?;
     let buffers = std::env::var("QLIVE_EDITOR_TOKEN").ok().filter(|s| !s.is_empty())
         .map(|token| preview.enable_editor(token, chain.target().to_path_buf()));
     preview.set_page(cold.page.clone());
@@ -557,7 +558,9 @@ fn source_locations(expanded: &qlive_core::includes::Expanded) -> Vec<serde_json
         .map(|(cell, range)| expanded.location_at_line(range.start_line)
             .map(|mut location| {
                 location.line += 1 + cell.source.lines().take_while(|line| line.trim().is_empty() || line.trim_start().starts_with("#|")).count();
-                serde_json::to_value(location).unwrap()
+                let mut value = serde_json::to_value(location).unwrap();
+                value["key"] = serde_json::json!(engine::cell_id(cell));
+                value
             }))
         .collect::<Option<Vec<_>>>();
     visible.unwrap_or_default()

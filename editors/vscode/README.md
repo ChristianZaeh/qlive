@@ -32,7 +32,7 @@ continue. Dependencies use Python name analysis with qlive's documented limits;
 an unparseable cell conservatively blocks later cells.
 
 Build and install the local VSIX with `python editors/vscode/package.py`, then
-`code --install-extension editors/vscode/qlive-preview-0.4.0.vsix --force`.
+`code --install-extension editors/vscode/qlive-preview-0.5.0.vsix --force`.
 
 To route the installed Quarto extension's existing Preview menus and shortcut into
 qlive, run `python editors/vscode/integrate_quarto.py <installed-quarto-extension-dir>`
@@ -64,3 +64,45 @@ node editors/vscode/smoke.js target/debug/qlive.exe
 ```
 
 The smoke check runs authored fixtures with installed Quarto and Python/Jupyter.
+
+
+## Preview comments and live agents
+
+Click **Comment**, then a preview paragraph, figure or cell. **Enter** saves the
+comment; **Shift+Enter** inserts a newline. Comments persist in the project-local
+`.qlive/agent-inbox.json` with an agent-readable `agent-inbox.md` projection.
+The nearest Quarto project or Git root owns the inbox; standalone files use their
+parent directory. Keep private inbox contents out of version control.
+
+Include `@codex` or `@claude` to start that installed, authenticated CLI automatically.
+`@agent` uses `qlive.defaultAgent` (initially Codex). Configure
+`qlive.codexExecutable` / `qlive.claudeExecutable` when needed; the Claude Code
+extension's bundled executable is detected automatically. CLI sign-in remains with
+the provider. Ordinary comments start no agent. Tagged requests require the VS Code
+preview bridge. Source snapshots, including unsaved included documents, accompany
+the request. Requests run serially per project and show queued/working/results.
+
+Agents return an answer or propose one complete source-file edit. Rust restricts
+runners to read operations; the bridge applies the proposed edit only when the
+current editor text exactly matches the captured snapshot. Newer typing produces
+a conflict in the inbox. Edits remain unsaved and undoable; save changed code to
+execute it. Resolve cancels pending work. Interrupted requests require a new
+comment. Changed or ambiguous preview locations remain in the inbox without a pin.
+This does not stream intermediate agent reasoning or execute code before save.
+
+Validation uses fake CLI runners, not paid model calls:
+
+```
+node editors/vscode/agent-smoke.js target/editor-next/debug/qlive.exe
+node editors/vscode/agent-editor-test.js
+```
+
+The optional comment DOM check exercises click anchoring, Enter/Shift+Enter,
+text escaping, pins and resolve without a browser:
+
+```
+pnpm --dir target/comment-dom add jsdom
+node editors/vscode/comment-dom-test.js
+```
+
+Create `target/comment-dom` first. Visual browser verification remains separate.

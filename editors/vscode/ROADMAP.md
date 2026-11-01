@@ -15,6 +15,7 @@ cells still run in a Python kernel.
 | New document/project/presentation, convert, render formats/projects | New-document template implemented in Rust; other Quarto commands remain available | Rust commands delegating cold work to Quarto CLI |
 | Nested files and output-to-source | Include tree, chapter buffers and mapped cell output navigation implemented | Final interactive cursor-jump verification |
 | Paper/Web toggle | Continuous paper appearance implemented without daemon restart | Detect PDF metadata for closer styling; exact pagination remains M4 |
+| Preview comments and agents | Project inbox, Enter submission, @codex/@claude runners and conflict-checked live edits implemented | Real authenticated provider sessions and richer multi-file proposals |
 | Paragraph updates | Conservative block rendering and patch transport implemented | Broader eligible subset and keystroke-to-paint latency gate |
 | Syntax, outline, completions, diagnostics, formatting, assist | Original Quarto extension remains the provider | Specify and implement a Rust language service; preserve existing authoring behavior |
 | Visual editor, citations/Zotero, math/diagram previews | Original Quarto extension remains the provider | Separate feature ports and UI parity fixtures |

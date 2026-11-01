@@ -102,11 +102,13 @@
 
       try {
         var patch = JSON.parse(msg);
+        if (patch.op === "comments") window.dispatchEvent(new Event("qlive-comments-changed"));
         if (patch && patch.op === "body") {
           replaceBody(patch.html);       // M2: whole body, swapped in place
         } else if (patch && patch.ops) {
           applyPatch(patch);             // later: single blocks by data-qlive-id
         }
+      window.dispatchEvent(new Event("qlive-preview-updated"));
       } catch (e) {
         console.warn("qlive: unrecognised message", msg);
       }

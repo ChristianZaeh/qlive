@@ -111,6 +111,8 @@ function showPreview(s) {
       window.addEventListener('message', event => {
         if (event.source === frame.contentWindow && event.data?.type === 'qlive-view-changed') {
           if (event.data.mode === 'paper' || event.data.mode === 'web') { mode = event.data.mode; vscode.postMessage({type:'view-mode',mode}); }
+        } else if (event.data?.type === 'comment-mode') {
+          frame.contentWindow.postMessage({type:'qlive-comment-mode'}, '*');
         } else if (event.data?.type === 'view-mode' && (event.data.mode === 'paper' || event.data.mode === 'web')) {
           mode = event.data.mode; frame.contentWindow.postMessage({type:'qlive-view',mode}, '*');
         }
@@ -156,6 +158,44 @@ function sendBuffer(s, buffer) {
     request.on('error', reject);
     request.end(body);
   });
+}
+
+function agentHttp(s, method, id, body) {
+  return new Promise((resolve,reject)=>{
+    const payload=body?JSON.stringify(body):'';
+    const req=http.request({hostname:'127.0.0.1',port:s.port,path:'/qlive/agent-result'+(id?'?id='+encodeURIComponent(id):''),method,
+      headers:{authorization:`Bearer ${s.token}`,'content-type':'application/json','content-length':Buffer.byteLength(payload)}},res=>{
+      let text='';res.on('data',chunk=>text+=chunk);res.on('end',()=>{try{const value=JSON.parse(text);if(res.statusCode!==200)throw new Error(value.error||'Agent request failed');resolve(value);}catch(e){reject(e);}});
+    });req.setTimeout(10000,()=>req.destroy(new Error('Agent result timed out')));req.on('error',reject);req.end(payload);
+  });
+}
+async function applyAgent(s,id) {
+  if(session!==s || (s.agentResults ||= new Set()).has(id)) return;
+  s.agentResults.add(id);
+  let status='failed',message='';
+  try {
+    const proposal=await agentHttp(s,'GET',id);
+    if(session!==s) return;
+    if(typeof proposal.file!=='string'||!s.files.has(fileKey(proposal.file))||typeof proposal.before!=='string'||typeof proposal.after!=='string')throw new Error('Agent proposed an invalid source edit');
+    const doc=await vscode.workspace.openTextDocument(vscode.Uri.file(proposal.file));
+    if(doc.getText()!==proposal.before){status='conflict';throw new Error('Source changed since this request. Your newer edits were preserved; submit another comment.');}
+    const editor=await vscode.window.showTextDocument(doc,{viewColumn:vscode.ViewColumn.One,preserveFocus:true});
+    if(session!==s || doc.getText()!==proposal.before){status='conflict';throw new Error('Source changed while the agent result was opening. Your edits were preserved.');}
+    const applied=await editor.edit(builder=>builder.replace(new vscode.Range(doc.positionAt(0),doc.positionAt(doc.getText().length)),proposal.after));
+    if(!applied){status='conflict';throw new Error('Editor rejected the edit because the document changed.');}
+    status='applied';message=proposal.summary+' Applied to the live editor. Save changed code to execute it.';
+  } catch(e){message=e.message;s.output.appendLine(message);}
+  if(session===s) await agentHttp(s,'POST',null,{id,status,message}).catch(e=>s.output.appendLine(e.message));
+}
+function agentEnvironment(uri) {
+  const config=vscode.workspace.getConfiguration('qlive',uri);
+  let claude=config.get('claudeExecutable','claude');
+  if(claude==='claude'){
+    const extension=vscode.extensions.getExtension('anthropic.claude-code');
+    const candidate=extension && require('node:path').join(extension.extensionPath,'resources','native-binary',process.platform==='win32'?'claude.exe':'claude');
+    if(candidate&&require('node:fs').existsSync(candidate))claude=candidate;
+  }
+  return {QLIVE_DEFAULT_AGENT:config.get('defaultAgent','codex'),QLIVE_CODEX_EXECUTABLE:config.get('codexExecutable','codex'),QLIVE_CLAUDE_EXECUTABLE:claude};
 }
 
 function stop() {
@@ -239,7 +279,7 @@ function activate(context) {
       const token = crypto.randomBytes(32).toString('hex');
       const executable = vscode.workspace.getConfiguration('qlive', doc.uri).get('executable', 'qlive');
       const child = spawn(executable, ['live', doc.uri.fsPath, '--port', String(port)], {
-        cwd: require('node:path').dirname(doc.uri.fsPath), env: { ...process.env, QLIVE_EDITOR_TOKEN: token }, windowsHide: true
+        cwd: require('node:path').dirname(doc.uri.fsPath), env: { ...process.env, ...agentEnvironment(doc.uri), QLIVE_EDITOR_TOKEN: token }, windowsHide: true
       });
       const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 50);
       status.command = 'qlive.open';
@@ -270,6 +310,8 @@ function activate(context) {
                     && s.sent.get(fileKey(open.uri.fsPath)) !== open.version + ':true') schedule(open);
                 }
               }
+            } else if (line.startsWith('QLIVE_AGENT_EDITS ')) {
+              void applyAgent(s, JSON.parse(line.slice('QLIVE_AGENT_EDITS '.length)).id);
             } else if (line.startsWith('QLIVE_REVEAL ')) {
               void revealSource(s, JSON.parse(line.slice('QLIVE_REVEAL '.length))).catch(error => output.appendLine(error.message));
             } else if (line.startsWith('QLIVE_EDITOR_STATUS ') && session === s) {
@@ -298,6 +340,7 @@ function activate(context) {
       });
     } catch (error) { void vscode.window.showErrorMessage(`Cannot start qlive: ${error.message}`); }
   }));
+  context.subscriptions.push(vscode.commands.registerCommand('qlive.comment',()=>session?.panel?.webview.postMessage({type:'comment-mode'})));
   context.subscriptions.push(vscode.commands.registerCommand('qlive.stop', stop));
   context.subscriptions.push(vscode.commands.registerCommand('qlive.togglePaperView', () => {
     if (!session) return;

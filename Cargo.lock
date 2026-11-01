@@ -1171,6 +1171,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "getrandom 0.2.17",
+ "serde",
  "serde_json",
  "tokio",
 ]

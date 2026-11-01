@@ -9,7 +9,7 @@ const crypto = require('node:crypto');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function waitFor(fn) {
-  const until = Date.now() + 45000;
+  const until = Date.now() + Number(process.env.QLIVE_TEST_TIMEOUT_MS || 45000);
   while (Date.now() < until) {
     if (await fn()) return;
     await sleep(100);

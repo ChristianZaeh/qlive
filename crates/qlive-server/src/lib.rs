@@ -18,6 +18,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 pub mod editor;
+pub mod comments;
 
 /// The client script, injected into every HTML response.
 pub const CLIENT_JS: &str = include_str!("../assets/client.js");
@@ -25,6 +26,7 @@ pub const CLIENT_JS: &str = include_str!("../assets/client.js");
 /// Shared state: where the rendered output lives, and who to tell when it changes.
 #[derive(Clone)]
 pub struct Preview {
+    comments: Option<comments::Comments>,
     editor: Option<editor::Editor>,
     sources: Arc<RwLock<Vec<serde_json::Value>>>,
     source_manifest: Arc<RwLock<serde_json::Value>>,
@@ -41,6 +43,7 @@ impl Preview {
     pub fn new(root: PathBuf, entry: String) -> Self {
         let (tx, _rx) = broadcast::channel(16);
         Self {
+            comments: None,
             editor: None,
             sources: Arc::new(RwLock::new(Vec::new())),
             source_manifest: Arc::new(RwLock::new(serde_json::Value::Null)),
@@ -85,9 +88,10 @@ impl Preview {
             if !self.set_editor_files(&files.iter().filter_map(|path| path.as_str().map(PathBuf::from)).collect::<Vec<_>>(), revision) { return; }
         }
         if let Ok(mut current) = self.sources.write() { *current = sources; }
-        if self.editor.is_some() {
-            if let Ok(mut current) = self.source_manifest.write() {
-                if *current != manifest { println!("QLIVE_SOURCES {manifest}"); *current = manifest; }
+        if let Ok(mut current) = self.source_manifest.write() {
+            if *current != manifest {
+                if self.editor.is_some() { println!("QLIVE_SOURCES {manifest}"); }
+                *current = manifest;
             }
         }
     }
@@ -102,6 +106,9 @@ pub async fn serve(preview: Preview, port: u16) -> Result<()> {
         .route("/qlive/ws", get(ws_upgrade))
         .route("/qlive/buffer", axum::routing::post(editor::update))
         .route("/qlive/reveal", axum::routing::post(editor::reveal))
+        .route("/qlive/comments", get(comments::list).post(comments::submit))
+        .route("/qlive/agent-result", get(comments::proposal).post(comments::acknowledge))
+        .route("/qlive/comments.js", get(comments_js))
         .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
         .route("/*path", get(file))
         .with_state(state);
@@ -115,11 +122,11 @@ pub async fn serve(preview: Preview, port: u16) -> Result<()> {
 async fn index(State(state): State<Arc<Preview>>) -> Response {
     let live = state.page.read().ok().and_then(|page| page.clone());
     if let Some(html) = live {
-        return Html(inject(&html)).into_response();
+        return Html(inject_comments(&html, state.comments.as_ref())).into_response();
     }
     let path = state.root.join(&state.entry);
     match tokio::fs::read_to_string(&path).await {
-        Ok(html) => Html(inject(&html)).into_response(),
+        Ok(html) => Html(inject_comments(&html, state.comments.as_ref())).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("cannot read {}: {e}", path.display()),
@@ -134,6 +141,18 @@ async fn client_js() -> Response {
         CLIENT_JS,
     )
         .into_response()
+}
+
+async fn comments_js() -> Response {
+    ([(header::CONTENT_TYPE, "application/javascript")], include_str!("../assets/comments.js")).into_response()
+}
+
+fn inject_comments(html: &str, comments: Option<&comments::Comments>) -> String {
+    let html = if let Some(comments) = comments {
+        html.replace("</head>", &format!("<meta name=\"qlive-comment-token\" content=\"{}\"></head>", comments.token))
+    } else { html.to_owned() };
+    let html = inject(&html);
+    if comments.is_some() { html.replace("</body>", "<script src=\"/qlive/comments.js\" defer></script></body>") } else { html }
 }
 
 async fn file(State(state): State<Arc<Preview>>, UrlPath(rel): UrlPath<String>) -> Response {

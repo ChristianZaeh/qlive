@@ -109,6 +109,12 @@ require saving. A Paper/Web toggle changes the preview's appearance without
 restarting the kernel; Paper view is a continuous page approximation, not exact PDF pagination.
 This is the initial M3 path, with no claim yet of sub-50-ms keystroke latency.
 
+Preview comments persist in a project-local agent inbox. Click **Comment**, select
+a preview location and press **Enter**. Mention `@codex` or `@claude` to start an
+installed CLI, or `@agent` for your configured default. Proposed edits apply to
+unchanged live editor snapshots; newer typing is preserved. See the extension
+README for provider setup and execution limits.
+
 The **Quarto Sources** tree shows nested includes. Clicking a rendered cell output
 opens the file and first code line that produced it. Single ordinary paragraph edits
 use a guarded block render and WebSocket patch; structural/global-feature edits use

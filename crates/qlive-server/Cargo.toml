@@ -8,4 +8,6 @@ license.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+getrandom = "0.2"
 tokio.workspace = true

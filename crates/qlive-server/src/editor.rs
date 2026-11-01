@@ -33,6 +33,9 @@ pub(crate) struct Editor {
 }
 
 impl Preview {
+    pub(crate) fn editor_authorized(&self, headers: &HeaderMap) -> bool {
+        self.editor.as_ref().is_some_and(|editor| headers.get("authorization").and_then(|v| v.to_str().ok()) == Some(format!("Bearer {}", editor.token).as_str()))
+    }
     pub fn enable_editor(&mut self, token: String, target: PathBuf) -> mpsc::Receiver<BufferUpdate> {
         let (tx, rx) = mpsc::channel();
         self.editor = Some(Editor { token, files: Arc::new(RwLock::new(std::fs::canonicalize(target).ok().into_iter().collect())),
