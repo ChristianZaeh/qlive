@@ -19,6 +19,7 @@
 //! render — for plain documents the body, for cell documents the engine markdown —
 //! and any difference turns the warm path off for that document.
 
+use crate::restart;
 use crate::session::{read_expanded, run_chain, start_session, Chain, Pass, Session};
 use anyhow::{anyhow, Result};
 use notify::{RecursiveMode, Watcher};
@@ -59,7 +60,8 @@ struct Live {
     incremental: Option<qlive_quarto::incremental::Document>,
 }
 
-pub async fn run(doc: PathBuf, after: Vec<PathBuf>, port: u16) -> Result<()> {
+pub async fn run(doc: PathBuf, after: Vec<PathBuf>, port: u16, fresh: bool) -> Result<()> {
+    let started = Instant::now();
     let tools = Toolchain::discover()?;
     let mut docs = Vec::with_capacity(after.len() + 1);
     for earlier in &after {
@@ -71,17 +73,21 @@ pub async fn run(doc: PathBuf, after: Vec<PathBuf>, port: u16) -> Result<()> {
     let target_source = read_expanded(chain.target())?.text;
     let has_cells = cells::from_markdown(&target_source).iter().any(Cell::is_code);
 
+    let mode = if has_cells { "cells" } else { "plain" };
+    let cached = if fresh { None } else { cached_cold(&tools, chain.target(), mode)? };
+    let restarted = cached.is_some();
     let (session, cold, pass) = if has_cells {
         let mut session = start_session(&tools, chain.target())?;
         let pass = run_chain(&mut session, &chain)?;
         report_pass("first run", &pass);
-        let cold = cold_cells(&tools, chain.target(), &pass)?;
+        let cold = match cached { Some(cold) => cold, None => cold_cells(&tools, chain.target(), &pass)? };
         (Some(session), cold, Some(pass))
     } else {
         if !after.is_empty() {
             println!("qlive: --after ignored: the previewed document has no code cells");
         }
-        (None, cold_plain(&tools, chain.target())?, None)
+        let cold = match cached { Some(cold) => cold, None => cold_plain(&tools, chain.target())? };
+        (None, cold, None)
     };
 
     let page_file = cold.page_file.clone();
@@ -108,10 +114,22 @@ pub async fn run(doc: PathBuf, after: Vec<PathBuf>, port: u16) -> Result<()> {
         pass,
         incremental: None,
     };
-    let expanded = read_expanded(live.chain.target())?;
-    let body = map_sources(&shell::main_content(&live.cold.page).unwrap(), &expanded, &preview, false, None);
-    let body = prepare_incremental(&mut live.incremental, &expanded.text, &body, &live.cold.capture.env);
-    preview.set_page(live.cold.shell.page(&body));
+    let warm_start = restarted && render_current(&mut live, &preview)?;
+    if restarted && !warm_start {
+        println!("qlive: restart cache unusable, rendering cold");
+        live.cold = match &live.pass {
+            Some(pass) => cold_cells(&live.tools, live.chain.target(), pass)?,
+            None => cold_plain(&live.tools, live.chain.target())?,
+        };
+    }
+    if warm_start {
+        println!("qlive: started from the restart cache in {:.0} ms (--fresh renders cold)", ms(started));
+    } else {
+        let expanded = read_expanded(live.chain.target())?;
+        let body = map_sources(&shell::main_content(&live.cold.page).unwrap(), &expanded, &preview, false, None);
+        let body = prepare_incremental(&mut live.incremental, &expanded.text, &body, &live.cold.capture.env);
+        preview.set_page(live.cold.shell.page(&body));
+    }
     {
         let preview = preview.clone();
         std::thread::spawn(move || {
@@ -166,6 +184,8 @@ fn cold_plain(tools: &Toolchain, doc: &Path) -> Result<Cold> {
         None
     };
     report_cold(started, warm.is_some());
+    let source_metadata = source_metadata(&expanded)?;
+    if warm.is_some() { remember(tools, doc, "plain", front, &source_metadata, &capture, &page, &page_file); }
 
     Ok(Cold {
         postprocess,
@@ -174,9 +194,56 @@ fn cold_plain(tools: &Toolchain, doc: &Path) -> Result<Cold> {
         page,
         page_file,
         front_matter: front.map(str::to_string),
-        source_metadata: source_metadata(&expanded)?,
+        source_metadata,
         warm,
     })
+}
+
+/// Only renders the warm path matched are stored, so a cached start never needs the
+/// self-check: it would have passed, as it does for every later save of a session.
+fn remember(tools: &Toolchain, doc: &Path, mode: &str, front: Option<&str>, source_metadata: &[(PathBuf, String)], capture: &Capture, page: &str, page_file: &Path) {
+    let stored = restart::key(tools, doc, mode, front, source_metadata)
+        .and_then(|key| restart::store(&key, capture, page, page_file));
+    if let Err(e) = stored { println!("qlive: restart cache not written: {e}"); }
+}
+
+/// The cold state a previous run stored for this front matter, project and Quarto.
+fn cached_cold(tools: &Toolchain, doc: &Path, mode: &str) -> Result<Option<Cold>> {
+    let expanded = read_expanded(doc)?;
+    let (front, _) = frontmatter::split(&expanded.text);
+    let source_metadata = source_metadata(&expanded)?;
+    let Some(entry) = restart::load(&restart::key(tools, doc, mode, front, &source_metadata)?) else { return Ok(None) };
+    let capture = entry.capture;
+    let postprocess = qlive_quarto::postprocess::Options::from_capture(&capture.metadata, &capture.env)?.with_cold_page(&entry.page);
+    let shell = Shell::from_page(&entry.page)?;
+    let warm = LuaWorker::start_quarto(&tools.pandoc, &capture.env, &capture.cwd, &capture.format, capture.citeproc)?;
+    Ok(Some(Cold {
+        postprocess,
+        capture,
+        shell,
+        page: entry.page,
+        page_file: entry.page_file,
+        front_matter: front.map(str::to_string),
+        source_metadata,
+        warm: Some(warm),
+    }))
+}
+
+/// A cached page holds the body of whenever it was cached; render the current one.
+/// `false` means the warm render failed and a cold render must replace the cache.
+fn render_current(live: &mut Live, preview: &Preview) -> Result<bool> {
+    let expanded = read_expanded(live.chain.target())?;
+    let dir = live.chain.target().parent().ok_or_else(|| anyhow!("document has no parent directory"))?.to_path_buf();
+    let text = match &live.pass {
+        Some(pass) => {
+            let all = vec![true; pass.cells.len()];
+            engine::to_markdown(&pass.cells, &pass.outputs, &notebook_stem(live.chain.target()), &dir, &all)?
+        }
+        None => frontmatter::split(&expanded.text).1.to_owned(),
+    };
+    let Some(worker) = live.cold.warm.as_mut() else { return Ok(false) };
+    push_warm(worker, &text, &live.cold.capture.metadata, &live.cold.postprocess, &live.cold.shell, &dir,
+        preview, &expanded, &mut live.incremental, &live.cold.capture.env, true, None)
 }
 
 /// Hand Quarto our notebook with `--no-execute`, so it renders our outputs and never
@@ -223,6 +290,8 @@ fn cold_cells(tools: &Toolchain, doc: &Path, pass: &Pass) -> Result<Cold> {
     let expanded = read_expanded(doc)?;
     let source = &expanded.text;
     let (front, _) = frontmatter::split(&source);
+    let source_metadata = source_metadata(&expanded)?;
+    if warm.is_some() { remember(tools, doc, "cells", front, &source_metadata, &capture, &page, &page_file); }
     Ok(Cold {
         postprocess,
         capture,
@@ -230,7 +299,7 @@ fn cold_cells(tools: &Toolchain, doc: &Path, pass: &Pass) -> Result<Cold> {
         page,
         page_file,
         front_matter: front.map(str::to_string),
-        source_metadata: source_metadata(&expanded)?,
+        source_metadata,
         warm,
     })
 }

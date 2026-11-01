@@ -11,6 +11,7 @@ mod editor;
 mod live;
 mod parity;
 mod preview;
+mod restart;
 mod session;
 
 use anyhow::Result;
@@ -56,6 +57,9 @@ enum Command {
         /// Port for the preview server.
         #[arg(long, default_value_t = 4444)]
         port: u16,
+        /// Ignore the restart cache: render cold with Quarto, as on a first start.
+        #[arg(long)]
+        fresh: bool,
     },
     /// Execute only the cells that changed, against a kernel that outlives the render.
     Cells {
@@ -104,7 +108,7 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Editor => editor::run(),
         Command::Preview { doc, port, to } => preview::run(doc, port, to).await,
-        Command::Live { doc, after, port } => live::run(doc, after, port).await,
+        Command::Live { doc, after, port, fresh } => live::run(doc, after, port, fresh).await,
         Command::Cells { doc, once, to } => cells::run(doc, once, to),
         Command::Parity { dir, limit, report } => parity::run(dir, limit, report),
         Command::Bench {

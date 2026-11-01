@@ -66,8 +66,14 @@ pub fn start_session(tools: &Toolchain, target: &Path) -> Result<Session> {
         .ok_or_else(|| anyhow!("document has no parent directory"))?;
 
     let started = Instant::now();
-    let mut kernel = Kernel::start(&python, dir)?;
-    let setup = qlive_quarto::inspect::kernel_setup(&tools.quarto, target, "html")?;
+    // Booting ipykernel and asking Quarto for its setup are independent and each
+    // takes about a second or more; overlap them.
+    let (kernel, setup) = std::thread::scope(|scope| {
+        let setup = scope.spawn(|| qlive_quarto::inspect::kernel_setup(&tools.quarto, target, "html"));
+        let kernel = Kernel::start(&python, dir);
+        (kernel, setup.join().unwrap_or_else(|_| Err(anyhow!("quarto inspect panicked"))))
+    });
+    let (mut kernel, setup) = (kernel?, setup?);
     kernel.setup(&setup.script, &setup.args, &setup.env)?;
     println!(
         "qlive: kernel ready with Quarto's setup in {:.0} ms (paid once)",

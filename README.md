@@ -89,7 +89,7 @@ file watcher inherits this; one built on typst-as-a-library does not.
 ```
 qlive doctor                  which quarto / pandoc / typst / python were found
 qlive bench [--doc F]         print the latency table for this machine
-qlive live F [--port N]       live preview: warm Quarto renders, pushed without reload
+qlive live F [--port N] [--fresh]  live preview: warm Quarto renders, pushed without reload
 qlive preview F [--port N]    cold render once, then re-render on save (M0)
 qlive cells F [--once]        execute only the cells that changed
 ```
@@ -140,6 +140,29 @@ it, a reload wipes it:
 On a ~25-line document at 15% CPU load. For a full chapter expect the bench's warm
 pipeline figure, ~80 ms. `quarto preview` takes ~1040 ms per save on an idle machine,
 and reloads the page.
+
+**Restart cache.** The cold render exists to learn Quarto's environment, metadata
+and page shell, which depend on everything except the body. qlive stores them under
+`%LOCALAPPDATA%\qlive\restart` (or `$XDG_CACHE_HOME`, `~/.cache`), keyed on the front
+matter (and that of included files), every `_quarto.yml`, `_metadata.yml` and
+`_brand.yml` above the document, the contents of files those YAML texts name (themes,
+CSS, CSL, bibliographies, templates), `QUARTO_PROFILE`, the Quarto install and the
+qlive build. A later start with the same key restores the capture, starts the warm
+worker and renders the *current* body, so edits made while qlive was stopped show.
+Only renders whose self-check passed are stored. A missing page resource or a FATAL
+warm render falls back to the cold path; `--fresh` skips the cache, and entries unused
+for 30 days are pruned. Rebuilding qlive invalidates every entry.
+
+Measured with a debug build while a corpus run loaded the CPU, launch until the page
+is served:
+
+| document | first start | restart |
+|---|---:|---:|
+| plain | 2,790 ms | **618 ms** (136 ms inside qlive) |
+| with Python cells | 7,206 ms | **3,295 ms**, of which ~2.8 s is ipykernel booting |
+
+Starting the kernel now overlaps with `quarto inspect`, which cut the kernel's
+readiness from 3.85 s to 2.83 s on every start.
 
 The warm path is taken only where it is known to match Quarto. The cold path (a full
 render and a reload) is used when:
