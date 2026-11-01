@@ -6,6 +6,7 @@
 
 pub mod blocks;
 pub mod cells;
+pub mod frontmatter;
 pub mod paths;
 pub mod toolchain;
 

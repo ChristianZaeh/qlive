@@ -89,9 +89,48 @@ file watcher inherits this; one built on typst-as-a-library does not.
 ```
 qlive doctor                  which quarto / pandoc / typst / python were found
 qlive bench [--doc F]         print the latency table for this machine
-qlive preview F [--port N]    cold render once, then re-render on save
+qlive live F [--port N]       live preview: warm Quarto renders, pushed without reload
+qlive preview F [--port N]    cold render once, then re-render on save (M0)
 qlive cells F [--once]        execute only the cells that changed
 ```
+
+### `qlive live`: preview without reloads
+
+One cold `quarto render` (with capture) yields the full page, its shell, and Quarto's
+pipeline to host warm. Each save then re-renders the body through Quarto's own reader
+and filters, adds the heading anchors Quarto's postprocessor would, splices the result
+into the shell, and pushes it over the WebSocket; the browser swaps `<main>` in place.
+
+Verified in a browser, with a marker set on `window` before each edit — a patch keeps
+it, a reload wipes it:
+
+| edit | path | time | reload? |
+|---|---|---:|---|
+| body: changed sentence + new paragraph with math | warm | 35 ms | no — marker kept |
+| front matter: new title | cold | 2042 ms | yes — marker gone, new title shown |
+| six further body edits | warm | 25–34 ms | no — 6 patches, marker kept |
+
+On a ~25-line document at 15% CPU load. For a full chapter expect the bench's warm
+pipeline figure, ~80 ms. `quarto preview` takes ~1040 ms per save on an idle machine,
+and reloads the page.
+
+The warm path is taken only where it is known to match Quarto. The cold path (a full
+render and a reload) is used when:
+
+* **the front matter changed** — the template, title block and metadata depend on it;
+* **Quarto's filters reported FATAL** — pandoc exits 0 regardless, so stderr decides;
+* **the self-check failed** at cold-render time. The body Quarto fed pandoc must equal
+  the document's body; engine preprocessing breaks that, so documents with executable
+  cells or includes get a cold render per save instead of a wrong preview.
+
+Known gaps:
+
+* **Documents with code cells are cold-only for now.** Joining `qlive cells` to the warm
+  path means reproducing the engine's markdown output, which is the next step.
+* Page scripts that ran at load (anchor.js link icons, code copy buttons, callout
+  collapse toggles) do not re-attach to swapped content. Math is re-typeset.
+* The whole body is swapped on each save. At 25–80 ms per render that is fine;
+  block-level patches are an optimisation, not a requirement.
 
 ### `qlive cells`: per-cell execution
 
@@ -201,7 +240,7 @@ working `as` and `dlltool`.
 | **M0** | scaffold: bench + cold render + watch + reload | **done** |
 | **M5a** | per-cell execution (`qlive cells`) | **done**: cell edit runs one cell, prose edit runs none |
 | **M1** | `pandoc lua` worker, whole-document warm passes | **done**: Quarto's own pipeline warm, 78 ms for 283 lines, parity verified |
-| **M2** | block rendering + DOM patching, `data-qlive-id` | p50 under 25 ms; HTML identical to `quarto render` on a 50-doc corpus |
+| **M2** | warm renders patched into the page, no reload | **done for documents without code cells**: 25–35 ms per save on a small document, ~80 ms expected on a chapter; block-level patching and a 50-doc parity corpus remain |
 | **M3** | VS Code buffer streaming, no save needed | keystroke → pixel under 50 ms p95 |
 | **M4** | typst as a library, per-page SVG patches | under 30 ms per edit |
 | **M5** | Jupyter kernel pool + per-chunk cache | prose edit = 0 executions |

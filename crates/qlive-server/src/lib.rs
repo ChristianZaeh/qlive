@@ -14,7 +14,7 @@ use axum::routing::get;
 use axum::Router;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 /// The client script, injected into every HTML response.
@@ -26,19 +26,41 @@ pub struct Preview {
     root: PathBuf,
     entry: String,
     tx: broadcast::Sender<String>,
+    /// When set, `/` serves this instead of the file on disk: the cold page's shell
+    /// with the latest warm body spliced in, so a newly opened tab sees current state.
+    page: Arc<RwLock<Option<String>>>,
 }
 
 impl Preview {
     /// `root` is the directory holding the cold render, `entry` its file name.
     pub fn new(root: PathBuf, entry: String) -> Self {
         let (tx, _rx) = broadcast::channel(16);
-        Self { root, entry, tx }
+        Self {
+            root,
+            entry,
+            tx,
+            page: Arc::new(RwLock::new(None)),
+        }
     }
 
     /// Tell every connected client to reload. Cheap and non-blocking; an error only
     /// means nobody is listening.
     pub fn notify_reload(&self) {
         let _ = self.tx.send("reload".to_string());
+    }
+
+    /// Replace the page `/` serves.
+    pub fn set_page(&self, html: String) {
+        if let Ok(mut page) = self.page.write() {
+            *page = Some(html);
+        }
+    }
+
+    /// Push a new body to every connected client, which swaps it into `<main>` in
+    /// place — no reload, scroll position kept.
+    pub fn send_body(&self, html: &str) {
+        let message = serde_json::json!({ "v": 1, "op": "body", "html": html });
+        let _ = self.tx.send(message.to_string());
     }
 
     pub fn entry(&self) -> &str {
@@ -63,6 +85,10 @@ pub async fn serve(preview: Preview, port: u16) -> Result<()> {
 }
 
 async fn index(State(state): State<Arc<Preview>>) -> Response {
+    let live = state.page.read().ok().and_then(|page| page.clone());
+    if let Some(html) = live {
+        return Html(inject(&html)).into_response();
+    }
     let path = state.root.join(&state.entry);
     match tokio::fs::read_to_string(&path).await {
         Ok(html) => Html(inject(&html)).into_response(),

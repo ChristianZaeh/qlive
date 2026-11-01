@@ -7,6 +7,7 @@
 
 mod bench;
 mod cells;
+mod live;
 mod preview;
 
 use anyhow::Result;
@@ -37,6 +38,14 @@ enum Command {
         /// Quarto format, e.g. html or typst. Defaults to the document's own.
         #[arg(long)]
         to: Option<String>,
+    },
+    /// Live preview: warm Quarto renders pushed into the page, no reload.
+    Live {
+        /// The .qmd or .md to preview.
+        doc: PathBuf,
+        /// Port for the preview server.
+        #[arg(long, default_value_t = 4444)]
+        port: u16,
     },
     /// Execute only the cells that changed, against a kernel that outlives the render.
     Cells {
@@ -72,6 +81,7 @@ enum Command {
 async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Preview { doc, port, to } => preview::run(doc, port, to).await,
+        Command::Live { doc, port } => live::run(doc, port).await,
         Command::Cells { doc, once, to } => cells::run(doc, once, to),
         Command::Bench {
             doc,

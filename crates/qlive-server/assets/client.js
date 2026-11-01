@@ -51,11 +51,12 @@
         return;
       }
 
-      // M2: {"v":1,"seq":n,"ops":[{"op":"replace","id":"b17","html":"…"}]}
       try {
         var patch = JSON.parse(msg);
-        if (patch && patch.ops) {
-          applyPatch(patch);
+        if (patch && patch.op === "body") {
+          replaceBody(patch.html);       // M2: whole body, swapped in place
+        } else if (patch && patch.ops) {
+          applyPatch(patch);             // later: single blocks by data-qlive-id
         }
       } catch (e) {
         console.warn("qlive: unrecognised message", msg);
@@ -66,6 +67,32 @@
       showBadge("daemon gone, retrying");
       setTimeout(connect, 500);
     };
+  }
+
+  // Swap everything in <main> after the title block, which belongs to the page
+  // shell (pandoc's template) and is not part of the warm body. No reload, so the
+  // scroll position and the rest of the page stay exactly where they were.
+  function replaceBody(html) {
+    var main = document.querySelector("main");
+    if (!main) {
+      location.reload();
+      return;
+    }
+    var header = main.querySelector("#title-block-header");
+    var node = header ? header.nextSibling : main.firstChild;
+    while (node) {
+      var next = node.nextSibling;
+      main.removeChild(node);
+      node = next;
+    }
+    main.insertAdjacentHTML("beforeend", html);
+
+    // Math is typeset client-side; only the new nodes need it.
+    if (window.MathJax && window.MathJax.typesetPromise) {
+      window.MathJax.typesetPromise([main]).catch(function () {});
+    }
+    window.__qlivePatches = (window.__qlivePatches || 0) + 1;
+    showBadge("updated", 700);
   }
 
   // Placeholder so the protocol is exercised end to end from M0 onwards.

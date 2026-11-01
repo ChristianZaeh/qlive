@@ -5,8 +5,10 @@
 //! patches against it. Anything qlive cannot do confidently comes back here.
 
 pub mod capture;
+pub mod shell;
 
 pub use capture::Capture;
+pub use shell::Shell;
 
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
@@ -81,13 +83,6 @@ pub fn output_path(doc: &Path, to: Option<&str>) -> PathBuf {
     };
     doc.with_extension(ext)
 }
-
-/// Extracting Quarto's HTML shell so patches can be applied inside it — M2.
-///
-/// The plan: locate the content container in the cold-rendered HTML, keep
-/// everything around it verbatim, and give every block a `data-qlive-id` so the
-/// client can replace single nodes. Not needed for M0, which reloads the page.
-pub mod shell {}
 
 #[cfg(test)]
 mod tests {
