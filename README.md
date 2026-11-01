@@ -96,6 +96,14 @@ qlive cells F [--once]        execute only the cells that changed
 
 ### `qlive live`: preview without reloads
 
+For **preview while typing without saving**, install the local
+[VS Code extension](editors/vscode/README.md) and run **qlive: Start Live Preview**.
+It streams the active document's buffer to a token-authenticated loopback endpoint,
+debounces edits by 100 ms, and patches the preview using the warm pipeline. Prose
+edits reuse existing cell outputs. Code and front-matter changes require a save.
+Only the preview's source document is streamed; included files still come from disk.
+This is the initial M3 path, with no claim yet of sub-50-ms keystroke latency.
+
 One cold `quarto render` (with capture) yields the full page, its shell, and Quarto's
 pipeline to host warm. Each save then re-renders the body through Quarto's own reader
 and filters, adds the heading anchors Quarto's postprocessor would, splices the result
@@ -250,6 +258,13 @@ cells write and reading the outputs off the served page:
 
 Each run is explained in the log: `ran cell 5 'x = 1': restores 'x' for cell 6`.
 
+Cell errors stay local: the error output appears in the failed cell, downstream
+readers get a `DependencyError`, and independent cells continue. Failed definitions
+are removed from the kernel so an old or partially updated value cannot be used as
+that cell's result. Opaque cells (including syntax errors) conservatively block
+later cells, because their dependencies cannot be determined. Fixing the failed
+source invalidates its dependent results and lets them run again.
+
 Deliberate limits. Method calls count as mutation only for known mutating methods
 (`append`, `sort`, `update`, …) and `inplace=True`, plus assignments into attributes or
 subscripts — counting every call would make `df.head()` a writer of `df` and bring the
@@ -388,9 +403,32 @@ working `as` and `dlltool`.
 | **M5a** | per-cell execution (`qlive cells`) | **done**: cell edit runs one cell, prose edit runs none |
 | **M5b** | cells in the live preview, one kernel across chained documents | **done**: prose 54 ms, one cell ~90 ms, no reloads |
 | **M6** | dependency graph instead of prefix invalidation | **done**: a cell runs when its source or what it reads changed; hidden state and mutation handled |
-| **M7** | Quarto's HTML postprocessor on a real DOM | next: 262 of 469 corpus documents still differ, mostly anchors, code-copy, figures |
+| **M7** | Quarto's HTML postprocessor on a real DOM | in progress: anchors, section ids, copy scaffolds, annotations and Bootstrap content classes ported; full-corpus gate still open |
 
 ## Parity against Quarto's test corpus
+
+M7's first slice uses an HTML5 DOM (`qlive-quarto::postprocess`) in both the live
+preview and the parity command. It ports heading/figure/table anchor classes,
+descendant section heading ids, source-code class hoisting and copy-button scaffolds,
+code annotation links/buttons, gutters and definition lists, and Bootstrap classes
+for blockquotes, figures, images and tables (including computational tables).
+Captured metadata controls `minimal`, `anchor-sections` and `code-copy`; captured
+language parameters supply the localized copy-button tooltip. Comparison now uses
+DOM serialization and preserves whitespace inside code and preformatted elements.
+The captured `has-bootstrap` flag gates Bootstrap rules, including section heading
+ids. Column layout, table cell/width processing and appendix processing remain open.
+The historical full-corpus results below predate M7 and its stricter comparator.
+
+The initial anchors/copy slice had **29 pass, 17 fail, 4 error** in the first 50
+eligible corpus documents. See [the latest M7 sample report](m7-parity-50.md) for
+results after the Bootstrap and annotation ports. This is a sample result,
+not an updated 469-document parity claim. The report's cause labels are heuristic;
+copy-scaffold and anchor labels can also indicate later processing still missing.
+
+`cargo test -p qlive-cli postprocessor_matches_quarto_features_and_themes -- --ignored`
+checks authored Bootstrap and annotation fixtures against installed Quarto and verifies
+captured flags for `theme: none` and `theme: pandoc`. Those unthemed pages have no
+`<main>` and are outside the current live shell's warm path.
 
 `qlive parity <dir>` renders each document with Quarto, renders its body through the
 warm path, and compares against Quarto's `<main>`. Documents with code cells, local
@@ -421,7 +459,7 @@ semantics, which regexes cannot give faithfully. Porting them onto a real DOM, i
 order of the table, is M7.
 | **M1** | `pandoc lua` worker, whole-document warm passes | **done**: Quarto's own pipeline warm, 78 ms for 283 lines, parity verified |
 | **M2** | warm renders patched into the page, no reload | **done for documents without code cells**: 25–35 ms per save on a small document, ~80 ms expected on a chapter; block-level patching and a 50-doc parity corpus remain |
-| **M3** | VS Code buffer streaming, no save needed | keystroke → pixel under 50 ms p95 |
+| **M3** | VS Code buffer streaming, no save needed | initial prose path implemented; includes overlays and sub-50-ms p95 gate remain open |
 | **M4** | typst as a library, per-page SVG patches | under 30 ms per edit |
 | **M5** | Jupyter kernel pool + per-chunk cache | prose edit = 0 executions |
 

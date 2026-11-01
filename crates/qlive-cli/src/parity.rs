@@ -184,7 +184,8 @@ fn compare(tools: &Toolchain, doc: &Path, page_file: &Path) -> Result<Outcome> {
             one_line(&rendered.diagnostics.join(" | "))
         )));
     }
-    let ours = shell::add_heading_anchors(&rendered.out);
+    let options = qlive_quarto::postprocess::Options::from_capture(&capture.metadata, &capture.env)?;
+    let ours = qlive_quarto::postprocess::process(&rendered.out, &options);
 
     let (a, b) = (shell::normalize_html(&quartos), shell::normalize_html(&ours));
     Ok(match first_difference(&a, &b) {
@@ -299,5 +300,46 @@ fn one_line(text: &str) -> String {
         format!("{}…", &flat[..flat.floor_char_boundary(300)])
     } else {
         flat
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "renders authored fixtures with installed Quarto"]
+    fn postprocessor_matches_quarto_features_and_themes() -> Result<()> {
+        let tools = Toolchain::discover()?;
+        let root = std::env::temp_dir().join(format!("qlive-postprocess-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root)?;
+        let cases = [
+            ("bootstrap", "", "> A quotation\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n![Caption](data:image/png;base64,AA==)\n"),
+            ("unthemed", "theme: none\n", "## Heading\n\n> A quotation\n"),
+            ("pandoc", "theme: pandoc\n", "## Heading\n\n> A quotation\n"),
+            ("annotations", "", "```python\nx = 1 # <1>\n```\n\n1. Explanation\n"),
+            ("hover", "code-annotations: hover\n", "```python\nx = 1 # <1>\n```\n\n1. Explanation\n"),
+            ("select", "code-annotations: select\n", "```python\nx = 1 # <1>\n```\n\n1. Explanation\n"),
+            ("disabled", "code-annotations: false\ncode-copy: false\nanchor-sections: false\n", "## Heading\n\n```python\nx = 1 # <1>\n```\n\n1. Explanation\n"),
+        ];
+        for (name, metadata, body) in cases {
+            let path = root.join(format!("{name}.qmd"));
+            std::fs::write(&path, format!("---\nformat: html\n{metadata}---\n\n{body}"))?;
+            if matches!(name, "unthemed" | "pandoc") {
+                // These formats have no <main>, so the live shell cannot warm-render
+                // them yet. Verify the actual captured flag independently.
+                let capture = qlive_quarto::capture::capture(&tools.quarto, &path, Some("html"))?;
+                let options = qlive_quarto::postprocess::Options::from_capture(&capture.metadata, &capture.env)?;
+                assert!(!options.bootstrap, "{name}");
+                continue;
+            }
+            match check(&tools, &path)? {
+                Outcome::Pass => (),
+                Outcome::Fail(diff) => panic!("{name}: {diff}"),
+                Outcome::Error(error) => panic!("{name}: {error}"),
+                Outcome::Fallback => panic!("{name}: unexpected fallback"),
+            }
+        }
+        Ok(())
     }
 }

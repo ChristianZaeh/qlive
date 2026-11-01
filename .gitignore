@@ -9,3 +9,6 @@
 
 # Python bytecode from importing the embedded worker
 __pycache__/
+
+# Local editor extension package
+*.vsix

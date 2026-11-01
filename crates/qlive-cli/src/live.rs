@@ -3,8 +3,8 @@
 //!
 //! **Plain documents.** One cold `quarto render` (with capture) yields the page, its
 //! shell, and Quarto's pipeline to host warm. A save re-renders the body through
-//! Quarto's own reader and filters, adds the heading anchors Quarto's postprocessor
-//! would, splices it into the shell and pushes it; the browser swaps `<main>`.
+//! Quarto's own reader and filters, applies the body rules from Quarto's postprocessor
+//! then splices it into the shell and pushes it; the browser swaps `<main>`.
 //!
 //! **Documents with code cells.** Quarto never executes anything. One kernel —
 //! shared, in order, by every document in the chain (`--after`), so variables carry
@@ -53,6 +53,7 @@ struct Live {
     /// `Some` when the target document has code cells.
     session: Option<Session>,
     cold: Cold,
+    pass: Option<Pass>,
 }
 
 pub async fn run(doc: PathBuf, after: Vec<PathBuf>, port: u16) -> Result<()> {
@@ -67,17 +68,17 @@ pub async fn run(doc: PathBuf, after: Vec<PathBuf>, port: u16) -> Result<()> {
     let target_source = read_expanded(chain.target())?.text;
     let has_cells = cells::from_markdown(&target_source).iter().any(Cell::is_code);
 
-    let (session, cold) = if has_cells {
+    let (session, cold, pass) = if has_cells {
         let mut session = start_session(&tools, chain.target())?;
         let pass = run_chain(&mut session, &chain)?;
         report_pass("first run", &pass);
         let cold = cold_cells(&tools, chain.target(), &pass)?;
-        (Some(session), cold)
+        (Some(session), cold, Some(pass))
     } else {
         if !after.is_empty() {
             println!("qlive: --after ignored: the previewed document has no code cells");
         }
-        (None, cold_plain(&tools, chain.target())?)
+        (None, cold_plain(&tools, chain.target())?, None)
     };
 
     let page_file = cold.page_file.clone();
@@ -90,7 +91,9 @@ pub async fn run(doc: PathBuf, after: Vec<PathBuf>, port: u16) -> Result<()> {
         .ok_or_else(|| anyhow!("render output has no file name"))?
         .to_string_lossy()
         .to_string();
-    let preview = Preview::new(root, entry);
+    let mut preview = Preview::new(root, entry);
+    let buffers = std::env::var("QLIVE_EDITOR_TOKEN").ok().filter(|s| !s.is_empty())
+        .map(|token| preview.enable_editor(token, chain.target().to_path_buf()));
     preview.set_page(cold.page.clone());
 
     let live = Live {
@@ -98,11 +101,12 @@ pub async fn run(doc: PathBuf, after: Vec<PathBuf>, port: u16) -> Result<()> {
         chain,
         session,
         cold,
+        pass,
     };
     {
         let preview = preview.clone();
         std::thread::spawn(move || {
-            if let Err(e) = watch(live, &preview) {
+            if let Err(e) = watch(live, &preview, buffers) {
                 eprintln!("qlive: watcher stopped: {e}");
             }
         });
@@ -242,6 +246,7 @@ fn on_save(live: &mut Live, preview: &Preview) -> Result<()> {
                         worker,
                         &markdown,
                         &live.cold.capture.metadata,
+                        &live.cold.capture.env,
                         &live.cold.shell,
                         dir,
                         preview,
@@ -256,11 +261,13 @@ fn on_save(live: &mut Live, preview: &Preview) -> Result<()> {
                         for line in &pass.ran {
                             println!("qlive:   ran {line}");
                         }
+                        live.pass = Some(pass);
                         return Ok(());
                     }
                 }
             }
             live.cold = cold_cells(&live.tools, live.chain.target(), &pass)?;
+            live.pass = Some(pass);
         }
         None => {
             if !front_changed {
@@ -274,6 +281,7 @@ fn on_save(live: &mut Live, preview: &Preview) -> Result<()> {
                         worker,
                         body,
                         &live.cold.capture.metadata,
+                        &live.cold.capture.env,
                         &live.cold.shell,
                         dir,
                         preview,
@@ -302,6 +310,7 @@ fn push_warm(
     worker: &mut LuaWorker,
     text: &str,
     metadata: &str,
+    env: &[(String, String)],
     shell: &Shell,
     root: &Path,
     preview: &Preview,
@@ -314,9 +323,11 @@ fn push_warm(
         );
         return Ok(false);
     }
-    // Anchors, as Quarto's postprocessor adds them; then image URLs versioned by
+    // Quarto body postprocessing, then image URLs versioned by
     // content, so a re-run figure is refetched instead of shown from cache.
-    let html = shell::version_images(&shell::add_heading_anchors(&rendered.out), root);
+    let options = qlive_quarto::postprocess::Options::from_capture(metadata, env)?;
+    let processed = qlive_quarto::postprocess::process(&rendered.out, &options);
+    let html = shell::version_images(&processed, root);
     preview.set_page(shell.page(&html));
     preview.send_body(&html);
     Ok(true)
@@ -325,7 +336,7 @@ fn push_warm(
 /// Watch every document in the chain and every file they include; a change to any
 /// of them starts a pass. The set is refreshed after each pass, since an edit can
 /// add or remove includes.
-fn watch(mut live: Live, preview: &Preview) -> Result<()> {
+fn watch(mut live: Live, preview: &Preview, buffers: Option<std::sync::mpsc::Receiver<qlive_server::editor::BufferUpdate>>) -> Result<()> {
     let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
     let mut watcher = notify::recommended_watcher(tx)?;
     let mut watched_dirs: Vec<PathBuf> = Vec::new();
@@ -334,7 +345,26 @@ fn watch(mut live: Live, preview: &Preview) -> Result<()> {
     // drops a file watch.
     watch_dirs(&mut watcher, &files, &mut watched_dirs)?;
 
-    while let Ok(event) = rx.recv() {
+    loop {
+        if let Some(buffers) = &buffers {
+            let mut latest = None;
+            while let Ok(update) = buffers.try_recv() {
+                if let Some(old) = latest.replace(update) {
+                    let old: qlive_server::editor::BufferUpdate = old;
+                    let _ = old.reply.send(Ok("superseded".into()));
+                }
+            }
+            if let Some(update) = latest {
+                let result = on_buffer(&mut live, preview, &update.text, update.revision)
+                    .map_err(|e| e.to_string());
+                let _ = update.reply.send(result);
+            }
+        }
+        let event = match rx.recv_timeout(Duration::from_millis(15)) {
+            Ok(event) => event,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => return Err(anyhow!("file watcher stopped")),
+        };
         let Ok(event) = event else { continue };
         let ours = event
             .paths
@@ -355,7 +385,48 @@ fn watch(mut live: Live, preview: &Preview) -> Result<()> {
         while rx.try_recv().is_ok() {}
     }
 
-    Err(anyhow!("file watcher stopped"))
+}
+
+/// Render unsaved prose, retaining outputs only if every executable cell is unchanged.
+fn on_buffer(live: &mut Live, preview: &Preview, text: &str, revision: u64) -> Result<String> {
+    let expanded = qlive_core::includes::expand(text, live.chain.target())?;
+    let (front, body) = frontmatter::split(&expanded.text);
+    if front.map(str::to_string) != live.cold.front_matter {
+        return Err(anyhow!("Save to rebuild changed front matter"));
+    }
+    let mut cells = cells::from_markdown(&expanded.text);
+    let code: Vec<_> = cells.iter().filter(|c| c.is_code()).map(|c| (&c.kind, c.source.as_str())).collect();
+    let markdown = if let Some(pass) = &live.pass {
+        let saved: Vec<_> = pass.cells.iter().filter(|c| c.is_code()).collect();
+        if !code.iter().copied().eq(saved.iter().map(|c| (&c.kind, c.source.as_str()))) {
+            return Err(anyhow!("Save to execute changed code cells"));
+        }
+        // Prose can change cell indices. Remap by executable-cell order and retain
+        // each code cell's captured key. Materialize cached figures at the new indices.
+        let mut saved_outputs = pass.cells.iter().zip(&pass.outputs).filter(|(c, _)| c.is_code());
+        let mut outputs = vec![None; cells.len()];
+        for (i, cell) in cells.iter_mut().enumerate().filter(|(_, c)| c.is_code()) {
+            let (saved, output) = saved_outputs.next().unwrap();
+            cell.key = saved.key.clone();
+            outputs[i] = output.clone();
+        }
+        let dir = live.chain.target().parent().unwrap();
+        engine::to_markdown(&cells, &outputs, &notebook_stem(live.chain.target()), dir, &vec![true; cells.len()])?
+    } else {
+        if !code.is_empty() { return Err(anyhow!("Save to initialize code cells")); }
+        body.to_owned()
+    };
+    let worker = live.cold.warm.as_mut().ok_or_else(|| anyhow!("This document requires a saved cold render"))?;
+    let rendered = worker.render_quarto(&markdown, &live.cold.capture.metadata)?;
+    if rendered.has_fatal() { return Err(anyhow!("Incomplete document; keeping the last preview")); }
+    let options = qlive_quarto::postprocess::Options::from_capture(&live.cold.capture.metadata, &live.cold.capture.env)?;
+    let html = qlive_quarto::postprocess::process(&rendered.out, &options);
+    let html = shell::version_images(&html, live.chain.target().parent().unwrap());
+    if !preview.is_current_buffer(revision) { return Ok("superseded".into()); }
+    preview.set_page(live.cold.shell.page(&html));
+    preview.send_body(&html);
+    println!("qlive: buffer {revision} pushed, no save");
+    Ok("updated".into())
 }
 
 /// Every file the preview depends on: the chain's documents and what they include.

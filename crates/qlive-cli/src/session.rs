@@ -101,6 +101,8 @@ pub fn run_chain(session: &mut Session, chain: &Chain) -> Result<Pass> {
     let infos = analyse(session, &sources)?;
 
     let plan = deps::plan(&infos, |sig| session.cache.contains_key(sig), &session.holder);
+    let inputs = cell_inputs(&infos);
+    let mut failed: Vec<bool> = plan.sigs.iter().map(|sig| session.cache.get(sig).is_some_and(has_error)).collect();
 
     let (mut executed, mut kernel_ms) = (0usize, 0.0f64);
     let mut ran = Vec::new();
@@ -113,7 +115,14 @@ pub fn run_chain(session: &mut Session, chain: &Chain) -> Result<Pass> {
             Step::Run(k) => {
                 let (d, i) = code[*k];
                 let source = &docs[d][i].source;
-                let outputs = if engine::cell_options(source).eval {
+                let blocked = inputs[*k].iter().copied().find(|i| failed[*i]);
+                let outputs = if let Some(upstream) = blocked {
+                    CellOutputs {
+                        outputs: vec![serde_json::json!({"output_type": "error", "ename": "DependencyError",
+                            "evalue": format!("Blocked: cell {} failed. Fix that cell first.", upstream + 1), "traceback": []})],
+                        execution_count: None,
+                    }
+                } else if engine::cell_options(source).eval {
                     let result = session.kernel.run(source)?;
                     kernel_ms += result.ms;
                     executed += 1;
@@ -124,10 +133,22 @@ pub fn run_chain(session: &mut Session, chain: &Chain) -> Result<Pass> {
                 } else {
                     CellOutputs::default()
                 };
+                failed[*k] = has_error(&outputs);
                 session.cache.insert(plan.sigs[*k].clone(), outputs);
-                deps::record(&mut session.holder, &infos[*k], &plan.sigs[*k]);
+                if failed[*k] {
+                    // A Python exception may leave old or partially updated bindings.
+                    // None of a failed cell's promised outputs is usable downstream.
+                    let names: Vec<_> = if infos[*k].opaque {
+                        session.holder.keys().chain(infos[*k].defines.iter()).cloned().collect()
+                    } else { infos[*k].defines.iter().cloned().collect() };
+                    session.kernel.forget(&names)?;
+                    deps::forget(&mut session.holder, &names);
+                } else {
+                    deps::record(&mut session.holder, &infos[*k], &plan.sigs[*k]);
+                }
                 if let Some(why) = &plan.run[*k] {
-                    ran.push(format!("cell {} `{}`: {why}", k + 1, first_line(source)));
+                    let status = if blocked.is_some() { "blocked" } else if failed[*k] { "failed" } else { "ran" };
+                    ran.push(format!("cell {} `{}`: {status}, {why}", k + 1, first_line(source)));
                 }
             }
         }
@@ -152,6 +173,29 @@ pub fn run_chain(session: &mut Session, chain: &Chain) -> Result<Pass> {
         kernel_ms,
         ran,
     })
+}
+
+fn has_error(outputs: &CellOutputs) -> bool {
+    outputs.outputs.iter().any(|output| output["output_type"] == "error")
+}
+
+/// Match the planner's last-writer dependencies, including conservative opaque cells.
+fn cell_inputs(infos: &[CellInfo]) -> Vec<Vec<usize>> {
+    let mut writers = HashMap::<String, usize>::new();
+    let mut opaque = None;
+    let mut inputs = Vec::new();
+    for (i, info) in infos.iter().enumerate() {
+        let mut reads = if info.opaque { (0..i).collect::<Vec<_>>() } else {
+            info.uses.iter().filter_map(|name| writers.get(name).copied().or(opaque)).collect()
+        };
+        if let Some(previous) = opaque { reads.push(previous); }
+        reads.sort_unstable();
+        reads.dedup();
+        inputs.push(reads);
+        if info.opaque { opaque = Some(i); writers.clear(); }
+        for name in &info.defines { writers.insert(name.clone(), i); }
+    }
+    inputs
 }
 
 /// What each cell defines and reads. Cached by source; only new sources are parsed.

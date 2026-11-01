@@ -17,12 +17,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
+pub mod editor;
+
 /// The client script, injected into every HTML response.
 pub const CLIENT_JS: &str = include_str!("../assets/client.js");
 
 /// Shared state: where the rendered output lives, and who to tell when it changes.
 #[derive(Clone)]
 pub struct Preview {
+    editor: Option<editor::Editor>,
     root: PathBuf,
     entry: String,
     tx: broadcast::Sender<String>,
@@ -36,6 +39,7 @@ impl Preview {
     pub fn new(root: PathBuf, entry: String) -> Self {
         let (tx, _rx) = broadcast::channel(16);
         Self {
+            editor: None,
             root,
             entry,
             tx,
@@ -75,6 +79,8 @@ pub async fn serve(preview: Preview, port: u16) -> Result<()> {
         .route("/", get(index))
         .route("/qlive/client.js", get(client_js))
         .route("/qlive/ws", get(ws_upgrade))
+        .route("/qlive/buffer", axum::routing::post(editor::update))
+        .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
         .route("/*path", get(file))
         .with_state(state);
 

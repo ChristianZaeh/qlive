@@ -1,0 +1,25 @@
+{
+  "name": "qlive-preview",
+  "displayName": "qlive Preview",
+  "description": "Quarto preview from unsaved editor buffers",
+  "version": "0.1.0",
+  "publisher": "qlive-local",
+  "engines": { "vscode": "^1.85.0" },
+  "main": "./extension.js",
+  "activationEvents": ["onCommand:qlive.start"],
+  "capabilities": { "untrustedWorkspaces": { "supported": false } },
+  "contributes": {
+    "commands": [
+      { "command": "qlive.start", "title": "qlive: Start Live Preview" },
+      { "command": "qlive.stop", "title": "qlive: Stop Live Preview" },
+      { "command": "qlive.open", "title": "qlive: Open Preview in Browser" }
+    ],
+    "configuration": {
+      "title": "qlive",
+      "properties": {
+        "qlive.executable": { "type": "string", "default": "qlive", "description": "Path to the qlive executable." },
+        "qlive.debounceMs": { "type": "number", "default": 100, "minimum": 20, "maximum": 2000, "description": "Pause after typing before updating the preview." }
+      }
+    }
+  }
+}

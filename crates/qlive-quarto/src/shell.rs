@@ -70,27 +70,12 @@ impl Shell {
     }
 }
 
-/// Reproduce the one postprocessing step of Quarto's that changes body markup:
-/// headings inside a section get `class="anchored" data-anchor-id="<section id>"`,
-/// which anchor.js uses for the link icons. Verified as the only content difference
-/// between the warm body and Quarto's `<main>`, besides attribute quote style.
+/// Compatibility helper for callers that need only anchors.
 pub fn add_heading_anchors(body: &str) -> String {
-    // Quarto anchors h2–h6 only (`["h2","h3","h4","h5","h6", …].forEach` in its HTML
-    // postprocessor); an h1 is never anchored. Found by the parity corpus.
-    static SECTION_HEADING: OnceLock<Regex> = OnceLock::new();
-    let re = SECTION_HEADING.get_or_init(|| {
-        Regex::new(r#"<section id="([^"]+)"([^>]*)>(\s*)<h([2-6])>"#).expect("valid regex")
-    });
-    re.replace_all(body, |caps: &regex::Captures| {
-        format!(
-            r#"<section id="{id}"{attrs}>{gap}<h{level} class="anchored" data-anchor-id="{id}">"#,
-            id = &caps[1],
-            attrs = &caps[2],
-            gap = &caps[3],
-            level = &caps[4],
-        )
+    crate::postprocess::process(body, &crate::postprocess::Options {
+        code_copy: false,
+        ..Default::default()
     })
-    .into_owned()
 }
 
 /// The content of a Quarto page's `<main>`, without the title block — i.e. the part
@@ -109,33 +94,10 @@ pub fn main_content(page: &str) -> Option<String> {
     Some(title.replace(&page[open_end..close], "").into_owned())
 }
 
-/// Normalise HTML for comparison: attribute quote style (Deno re-serialises `'` as
-/// `"`) and whitespace between and inside text runs, neither of which a browser
-/// renders differently.
+/// Compare DOM serialization, ignoring attribute order and ordinary prose
+/// whitespace while preserving whitespace in code and other preformatted content.
 pub fn normalize_html(html: &str) -> String {
-    static SINGLE_QUOTED: OnceLock<Regex> = OnceLock::new();
-    static SPACE: OnceLock<Regex> = OnceLock::new();
-    static BETWEEN_TAGS: OnceLock<Regex> = OnceLock::new();
-    static BEFORE_CLOSE: OnceLock<Regex> = OnceLock::new();
-    static BOOLEAN: OnceLock<Regex> = OnceLock::new();
-    let quotes = SINGLE_QUOTED.get_or_init(|| Regex::new(r#"=\s*'([^'"]*)'"#).expect("valid regex"));
-    let space = SPACE.get_or_init(|| Regex::new(r"\s+").expect("valid regex"));
-    let between = BETWEEN_TAGS.get_or_init(|| Regex::new(r">\s+<").expect("valid regex"));
-    // `aria-hidden="true" >` and `…="true">` are the same tag.
-    let before_close = BEFORE_CLOSE.get_or_init(|| Regex::new(r"\s+(/?>)").expect("valid regex"));
-    // A bare boolean attribute and `attr=""` are the same attribute; Deno writes the
-    // latter. Applied to both sides, so text containing these words cancels out.
-    let boolean = BOOLEAN.get_or_init(|| {
-        Regex::new(
-            r"\s(allowfullscreen|hidden|disabled|checked|controls|autoplay|loop|muted|defer|async|readonly|required|selected|open|reversed|novalidate|playsinline|default|itemscope)([\s/>])",
-        )
-        .expect("valid regex")
-    });
-    let html = quotes.replace_all(html, r#"="$1""#);
-    let html = space.replace_all(&html, " ");
-    let html = boolean.replace_all(&html, r#" $1=""$2"#);
-    let html = before_close.replace_all(&html, "$1");
-    between.replace_all(&html, "><").trim().to_string()
+    crate::postprocess::comparison_html(html)
 }
 
 /// Version every local image by a hash of its bytes: `src="a.png"` becomes
@@ -207,7 +169,7 @@ mod tests {
     #[test]
     fn h1_is_never_anchored() {
         let body = "<section id=\"top\" class=\"level1\"><h1>Top</h1></section>";
-        assert_eq!(add_heading_anchors(body), body);
+        assert_eq!(normalize_html(&add_heading_anchors(body)), normalize_html(body));
     }
 
     #[test]
@@ -289,13 +251,13 @@ mod tests {
         let body = "<section id=\"heading\" class=\"level2\">\n<h2>Heading</h2>\n<p>x</p>\n</section>";
         let out = add_heading_anchors(body);
         assert!(out.contains(r#"<h2 class="anchored" data-anchor-id="heading">Heading</h2>"#), "{out}");
-        assert!(out.contains(r#"<section id="heading" class="level2">"#), "section untouched");
+        assert!(out.contains(r#"<section class="level2" id="heading">"#), "section untouched");
     }
 
     #[test]
-    fn leaves_headings_outside_sections_alone() {
+    fn anchors_headings_outside_sections_too() {
         let body = "<h2>Loose</h2><p>x</p>";
-        assert_eq!(add_heading_anchors(body), body);
+        assert!(add_heading_anchors(body).contains("class=\"anchored\""));
     }
 
     #[test]

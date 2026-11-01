@@ -10,3 +10,6 @@ base64.workspace = true
 regex.workspace = true
 serde_json.workspace = true
 qlive-core.workspace = true
+
+kuchiki = "0.8"
+serde_yaml = "0.9"
