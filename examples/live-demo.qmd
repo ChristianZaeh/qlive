@@ -1,0 +1,25 @@
+---
+title: qlive live demo
+format: html
+---
+
+## Text
+
+Edit this sentence and save — the page updates without a reload.
+
+$$
+E = mc^2
+$$
+
+## Python
+
+```{python}
+import math
+x = 21
+```
+
+```{python}
+print(x * 2, math.pi)
+```
+
+Change `x` above and save: only the cells that depend on it run again.

@@ -14,3 +14,8 @@ __pycache__/
 *.vsix
 
 .qlive/
+
+# qlive live renders next to the source
+*.qlive.html
+*.qlive.ipynb
+*.qlive_files/
