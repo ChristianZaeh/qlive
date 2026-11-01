@@ -65,7 +65,9 @@ async function main() {
     assert.equal((await post(edit.replace('Buffer test', 'Changed title'))).status, 409);
     const bursts = await Promise.all(Array.from({ length: 8 }, (_, i) => post(edit + `\nREVISION ${i}\n`)));
     assert.ok(bursts.every(response => response.status === 200));
-    assert.match(await (await fetch(url)).text(), /REVISION 7/);
+    const revisions = await Promise.all(bursts.map(response => response.json()));
+    const latest = revisions.reduce((best, response, i) => response.revision > revisions[best].revision ? i : best, 0);
+    assert.ok((await (await fetch(url)).text()).includes(`REVISION ${latest}`));
     await stop();
     const source = '---\ntitle: Cells\n---\n\nSAVED PROSE\n\n```{python}\nx = 2\n```\n\n```{python}\nprint("dependent", x + 1)\n```\n\n```{python}\nprint("unrelated working")\n```\n';
     await fs.writeFile(doc, source);
@@ -84,7 +86,31 @@ async function main() {
     assert.doesNotMatch(html, /dependent 3/);
     await fs.writeFile(doc, broken.replace('x = 1 / 0', 'x = 10'));
     await waitFor(async () => (await (await fetch(url)).text()).includes('dependent 11'));
+    await stop();
+    const chapters = path.join(root, 'chapters');
+    await fs.mkdir(chapters);
+    const one = path.join(chapters, 'one.qmd');
+    const two = path.join(chapters, 'two.qmd');
+    await fs.writeFile(one, '## Chapter\n\n```{python}\nx = 42\n```\n\n{{< include chapters/two.qmd >}}\n');
+    await fs.writeFile(two, '## Nested\n\n```{python}\nprint("nested result", x)\n```\n');
+    await fs.writeFile(doc, '---\ntitle: Master\n---\n\n{{< include chapters/one.qmd >}}\n');
+    launch();
+    await waitFor(() => logs.includes(url));
+    const nestedHtml = await (await fetch(url)).text();
+    assert.match(nestedHtml, /nested result 42/);
+    assert.match(nestedHtml, /data-qlive-source="1"/);
+    const manifest = JSON.parse(logs.split('\n').find(line => line.startsWith('QLIVE_SOURCES ')).slice('QLIVE_SOURCES '.length));
+    assert.equal(manifest.files.length, 3);
+    assert.equal(manifest.edges[1].parent, one);
+    assert.equal(manifest.edges[1].file, two);
+    assert.equal((await fetch(`${url}/qlive/reveal`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 1 }) })).status, 200);
+    await waitFor(() => logs.includes('QLIVE_REVEAL '));
+    const location = JSON.parse(logs.split('\n').find(line => line.startsWith('QLIVE_REVEAL ')).slice('QLIVE_REVEAL '.length));
+    assert.equal(location.file, two);
+    assert.equal(location.line, 3);
+    assert.equal((await fetch(`${url}/qlive/reveal`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 99 }) })).status, 404);
     console.log('PASS: unsaved buffers, disk preservation, auth, target restriction, coalescing, cached cell outputs, isolated failure, blocked dependents, recovery');
+    console.log('PASS: nested include tree and source IDs resolve to the producing chapter and line');
   } catch (error) { console.error(logs); throw error; }
   finally { await stop(); }
 }

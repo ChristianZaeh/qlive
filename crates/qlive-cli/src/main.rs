@@ -7,6 +7,7 @@
 
 mod bench;
 mod cells;
+mod editor;
 mod live;
 mod parity;
 mod preview;
@@ -30,6 +31,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Native editor operations: one JSON request on stdin, one JSON response on stdout.
+    Editor,
     /// Cold-render once, then watch the file and re-render on change.
     Preview {
         /// The .qmd or .md to preview.
@@ -99,6 +102,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Editor => editor::run(),
         Command::Preview { doc, port, to } => preview::run(doc, port, to).await,
         Command::Live { doc, after, port } => live::run(doc, after, port).await,
         Command::Cells { doc, once, to } => cells::run(doc, once, to),

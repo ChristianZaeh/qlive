@@ -164,7 +164,7 @@ fn check(tools: &Toolchain, doc: &Path) -> Result<Outcome> {
 }
 
 fn compare(tools: &Toolchain, doc: &Path, page_file: &Path) -> Result<Outcome> {
-    let capture = qlive_quarto::capture::capture(&tools.quarto, doc, Some("html"))?;
+    let capture = qlive_quarto::capture::capture_with(&tools.quarto, doc, Some("html"), &["--no-execute"])?;
     let page = std::fs::read_to_string(page_file)
         .map_err(|e| anyhow!("no HTML output at {}: {e}", page_file.display()))?;
     let quartos = shell::main_content(&page).ok_or_else(|| anyhow!("Quarto's page has no <main>"))?;
@@ -184,7 +184,7 @@ fn compare(tools: &Toolchain, doc: &Path, page_file: &Path) -> Result<Outcome> {
             one_line(&rendered.diagnostics.join(" | "))
         )));
     }
-    let options = qlive_quarto::postprocess::Options::from_capture(&capture.metadata, &capture.env)?;
+    let options = qlive_quarto::postprocess::Options::from_capture(&capture.metadata, &capture.env)?.with_cold_page(&page);
     let ours = qlive_quarto::postprocess::process(&rendered.out, &options);
 
     let (a, b) = (shell::normalize_html(&quartos), shell::normalize_html(&ours));
@@ -246,7 +246,20 @@ fn skip_reason(doc: &Path, root: &Path) -> Option<&'static str> {
         Ok(expanded) => expanded.text,
         Err(_) => return Some("include cannot be resolved"),
     };
-    if cells::from_markdown(&source).iter().any(cells::Cell::is_code) {
+    // Quarto executes embedded qmd/ipynb documents as a separate render, even if
+    // the parent itself has no executable cells. Never enter that path in a corpus run.
+    if source.to_ascii_lowercase().split("{{<").skip(1).any(|s| s.trim_start().strip_prefix("embed")
+        .is_some_and(|rest| rest.starts_with(char::is_whitespace) || rest.starts_with('>'))) {
+        return Some("embedded documents (may execute code)");
+    }
+    let nested_code = source.lines().any(|line| {
+        let line = line.trim_start();
+        let fence = line.chars().take_while(|c| matches!(c, '`' | '~')).count();
+        if fence < 3 { return false; }
+        let info = line[fence..].trim_start();
+        info.starts_with('{') && !info.starts_with("{.") && !info.starts_with("{=") && !info.starts_with("{#")
+    });
+    if nested_code || cells::from_markdown(&source).iter().any(cells::Cell::is_code) {
         return Some("code cells (third-party code, not executed)");
     }
     let (front, _) = frontmatter::split(&source);
@@ -308,12 +321,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn corpus_skips_embeds_and_cells_inside_divs_without_rendering() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("qlive-skip-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root)?;
+        let path = root.join("test.qmd");
+        for source in ["{{< embed child.qmd >}}", "{{<\nEMBED child.ipynb >}}"] {
+            std::fs::write(&path, source)?;
+            assert_eq!(skip_reason(&path, &root), Some("embedded documents (may execute code)"));
+        }
+        std::fs::write(&path, "::: {.callout-note}\n\n```{python}\nraise RuntimeError()\n```\n\n:::\n")?;
+        assert_eq!(skip_reason(&path, &root), Some("code cells (third-party code, not executed)"));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "renders an authored large document with installed Quarto"]
+    fn paragraph_patches_match_full_quarto_and_measure_worker_cost() -> Result<()> {
+        let tools = Toolchain::discover()?;
+        let root = std::env::temp_dir().join(format!("qlive-incremental-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root)?;
+        let path = root.join("large.qmd");
+        let mut source = "---\ntitle: Paragraph parity\nformat: html\n---\n\n".to_owned();
+        for i in 0..300 { source.push_str(&format!("## Section {i}\n\nParagraph {i} with **bold** words and ordinary text.\n\n")); }
+        std::fs::write(&path, &source)?;
+        let capture = qlive_quarto::capture::capture(&tools.quarto, &path, Some("html"))?;
+        let page = std::fs::read_to_string(path.with_extension("html"))?;
+        let options = qlive_quarto::postprocess::Options::from_capture(&capture.metadata, &capture.env)?.with_cold_page(&page);
+        let mut worker = LuaWorker::start_quarto(&tools.pandoc, &capture.env, &capture.cwd, &capture.format)?;
+        let initial = worker.render_quarto(frontmatter::split(&source).1, &capture.metadata)?;
+        let html = qlive_quarto::postprocess::process(&initial.out, &options);
+        let mut document = qlive_quarto::incremental::Document::prepare(&source, &html).expect("eligible fixture");
+        let mut partial_ms = Vec::new();
+        let mut full_ms = Vec::new();
+        for i in 0..5 {
+            let edited = source.replace("Paragraph 150 with", &format!("Edited paragraph {i} with"));
+            let change = document.change(&edited).expect("one paragraph changed");
+            let partial = worker.render_quarto(&change.text, &capture.metadata)?;
+            assert!(!partial.has_fatal());
+            partial_ms.push(partial.ms);
+            document.replace(change, &partial.out).expect("one paragraph returned");
+            let full = worker.render_quarto(frontmatter::split(&edited).1, &capture.metadata)?;
+            full_ms.push(full.ms);
+            let expected = qlive_quarto::postprocess::process(&full.out, &options);
+            let expected = qlive_quarto::incremental::Document::prepare(&edited, &expected).unwrap();
+            assert_eq!(shell::normalize_html(&document.html), shell::normalize_html(&expected.html));
+        }
+        partial_ms.sort_by(f64::total_cmp);
+        full_ms.sort_by(f64::total_cmp);
+        println!("300 sections, 5 edits: paragraph worker median {:.1} ms; full worker median {:.1} ms; identical HTML", partial_ms[2], full_ms[2]);
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "renders authored fixtures with installed Quarto"]
     fn postprocessor_matches_quarto_features_and_themes() -> Result<()> {
         let tools = Toolchain::discover()?;
         let root = std::env::temp_dir().join(format!("qlive-postprocess-test-{}", std::process::id()));
         std::fs::create_dir_all(&root)?;
         let cases = [
+            ("footnotes", "", "A note[^1].\n\n[^1]: Current footnote.\n"),
+            ("plain-appendix", "appendix-style: plain\n", "A note[^1].\n\n[^1]: Current footnote.\n"),
+            ("no-appendix", "appendix-style: none\n", "A note[^1].\n\n[^1]: Current footnote.\n"),
+            ("localized-notes", "lang: de\n", "A note[^1].\n\n[^1]: Current footnote.\n"),
+            ("authored-appendix", "", "## Body\n\nText.\n\n## Extra {.appendix}\n\nDetails.\n"),
+            ("citation-appendix", "title: Citation fixture\ncitation: true\ndate: 2023-03-01\n", "## Body\n\nText.\n"),
             ("bootstrap", "", "> A quotation\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n![Caption](data:image/png;base64,AA==)\n"),
             ("unthemed", "theme: none\n", "## Heading\n\n> A quotation\n"),
             ("pandoc", "theme: pandoc\n", "## Heading\n\n> A quotation\n"),

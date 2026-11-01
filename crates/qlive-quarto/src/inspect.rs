@@ -31,9 +31,16 @@ pub struct KernelSetup {
 /// Resolve the setup for `doc` rendered to `format` (e.g. `html`).
 pub fn kernel_setup(quarto: &Path, doc: &Path, format: &str) -> Result<KernelSetup> {
     let doc = qlive_core::absolute(doc)?;
+    // `quarto inspect` resolves nested includes relative to the includer, while
+    // render resolves them relative to the master. Inspect the already-expanded
+    // document in the same directory so kernel options match the rendered master.
+    let source = std::fs::read_to_string(&doc)?;
+    let expanded = qlive_core::includes::expand(&source, &doc)?;
+    let temporary = if expanded.files.len() > 1 { Some(InspectInput::new(&doc, &expanded.text)?) } else { None };
+    let input = temporary.as_ref().map(|temp| temp.path.as_path()).unwrap_or(&doc);
     let out = Command::new(quarto)
         .arg("inspect")
-        .arg(&doc)
+        .arg(input)
         .output()
         .map_err(|e| anyhow!("could not run quarto inspect: {e}"))?;
     if !out.status.success() {
@@ -56,6 +63,22 @@ pub fn kernel_setup(quarto: &Path, doc: &Path, format: &str) -> Result<KernelSet
         args,
         env,
     })
+}
+
+struct InspectInput { path: PathBuf }
+impl InspectInput {
+    fn new(doc: &Path, text: &str) -> Result<Self> {
+        use std::io::Write;
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let path = doc.parent().unwrap().join(format!(".qlive-inspect-{}-{nonce}.qmd", std::process::id()));
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        let temporary = Self { path };
+        file.write_all(text.as_bytes())?;
+        Ok(temporary)
+    }
+}
+impl Drop for InspectInput {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.path); }
 }
 
 /// The pure part, so it can be tested on a captured `quarto inspect` payload.

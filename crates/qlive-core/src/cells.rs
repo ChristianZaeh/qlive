@@ -47,6 +47,26 @@ pub enum Action {
     Execute,
 }
 
+/// Executable cells in source coordinates, shared by editor navigation and execution.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CodeRange {
+    /// 0-based opening fence and closing fence lines, inclusive.
+    pub start_line: usize,
+    pub end_line: usize,
+    pub language: String,
+}
+
+pub fn code_ranges(source: &str) -> Vec<CodeRange> {
+    blocks::split(source).into_iter().filter_map(|block| {
+        if block.kind != BlockKind::CodeFence { return None; }
+        executable_language(&block.text).map(|language| CodeRange {
+            start_line: block.start_line - 1,
+            end_line: block.end_line - 1,
+            language,
+        })
+    }).collect()
+}
+
 /// Split a Quarto document into notebook cells. Front matter and prose join the
 /// markdown cells, exactly as `quarto convert` arranges them.
 pub fn from_markdown(source: &str) -> Vec<Cell> {

@@ -1,5 +1,8 @@
 # qlive parity
 
+Historical sample before the embed/nested-cell skip fix. Embedded child documents
+were not excluded, so this is not a verified no-execution run.
+
 Corpus: `C:\dev\quarto-tests\tests\docs\smoke-all`. 50 documents run in 107 s.
 
 | bucket | documents | meaning |
@@ -9,7 +12,7 @@ Corpus: `C:\dev\quarto-tests\tests\docs\smoke-all`. 50 documents run in 107 s.
 | **fail** | **9** | **warm output differs: a wrong preview** |
 | error | 4 | Quarto could not render it as HTML |
 
-Skipped, never executed:
+Skipped from direct corpus renders (embeds were not filtered in this run):
 
 - code cells (third-party code, not executed): 365
 - declares an engine: 8

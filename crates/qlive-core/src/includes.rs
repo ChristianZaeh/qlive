@@ -30,10 +30,44 @@ use std::path::{Path, PathBuf};
 pub struct Expanded {
     pub text: String,
     pub files: Vec<PathBuf>,
+    pub spans: Vec<SourceSpan>,
+    pub edges: Vec<IncludeEdge>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IncludeEdge { pub parent: PathBuf, pub file: PathBuf }
+
+#[derive(Debug, Clone)]
+pub struct SourceSpan {
+    pub start: usize,
+    pub end: usize,
+    pub file: PathBuf,
+    /// 0-based source line at the span's beginning.
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SourceLocation {
+    pub file: PathBuf,
+    pub line: usize,
+}
+
+impl Expanded {
+    pub fn location_at_line(&self, line: usize) -> Option<SourceLocation> {
+        let byte: usize = self.text.split_inclusive('\n').take(line).map(str::len).sum();
+        let span = self.spans.iter().find(|s| s.start <= byte && byte < s.end)?;
+        let offset = self.text[span.start..byte].bytes().filter(|b| *b == b'\n').count();
+        Some(SourceLocation { file: span.file.clone(), line: span.line + offset })
+    }
 }
 
 /// Expand every include in `source`, the text of the document at `master`.
 pub fn expand(source: &str, master: &Path) -> Result<Expanded> {
+    expand_with(source, master, |path| Ok(std::fs::read_to_string(path)?))
+}
+
+/// Use editor buffers for included files without writing them to disk.
+pub fn expand_with<F: FnMut(&Path) -> Result<String>>(source: &str, master: &Path, read: F) -> Result<Expanded> {
     let base = master
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent directory", master.display()))?
@@ -44,16 +78,20 @@ pub fn expand(source: &str, master: &Path) -> Result<Expanded> {
         root,
         stack: vec![normalise(master)],
         files: vec![normalise(master)],
+        spans: Vec::new(),
+        master: normalise(master),
+        read,
+        edges: Vec::new(),
     };
 
     let mut out = String::with_capacity(source.len());
-    let mut segment: Vec<&str> = Vec::new();
+    let mut segment: Vec<(usize, &str)> = Vec::new();
     let mut fence: Option<String> = None;
 
-    for line in lines_keeping_newlines(source) {
+    for (line_number, line) in lines_keeping_newlines(source).into_iter().enumerate() {
         match &fence {
             Some(marker) => {
-                out.push_str(line);
+                ctx.append(&mut out, line, master, line_number);
                 if line.trim_start().starts_with(marker.as_str()) && line.trim() == marker.trim() {
                     fence = None;
                 }
@@ -61,10 +99,10 @@ pub fn expand(source: &str, master: &Path) -> Result<Expanded> {
             None => {
                 if let Some(marker) = executable_fence(line) {
                     ctx.flush(&mut segment, &mut out)?;
-                    out.push_str(line);
+                    ctx.append(&mut out, line, master, line_number);
                     fence = Some(marker);
                 } else {
-                    segment.push(line);
+                    segment.push((line_number, line));
                 }
             }
         }
@@ -74,28 +112,40 @@ pub fn expand(source: &str, master: &Path) -> Result<Expanded> {
     Ok(Expanded {
         text: out,
         files: ctx.files,
+        spans: ctx.spans,
+        edges: ctx.edges,
     })
 }
 
-struct Expansion {
+struct Expansion<F> {
     base: PathBuf,
     root: PathBuf,
     /// Files being expanded right now, for circularity.
     stack: Vec<PathBuf>,
     files: Vec<PathBuf>,
+    spans: Vec<SourceSpan>,
+    master: PathBuf,
+    read: F,
+    edges: Vec<IncludeEdge>,
 }
 
-impl Expansion {
+impl<F: FnMut(&Path) -> Result<String>> Expansion<F> {
+    fn append(&mut self, out: &mut String, text: &str, file: &Path, line: usize) {
+        if text.is_empty() { return; }
+        let start = out.len();
+        out.push_str(text);
+        self.spans.push(SourceSpan { start, end: out.len(), file: file.to_path_buf(), line });
+    }
     /// Expand includes in a run of markdown lines from the master.
-    fn flush(&mut self, segment: &mut Vec<&str>, out: &mut String) -> Result<()> {
+    fn flush(&mut self, segment: &mut Vec<(usize, &str)>, out: &mut String) -> Result<()> {
         // Quarto skips a whole markdown cell that disables shortcodes.
         let disabled = segment
             .iter()
-            .any(|l| l.trim_start().starts_with("```") && l.replace(' ', "").contains("{shortcodes=false}"));
-        for line in segment.drain(..) {
+            .any(|(_, l)| l.trim_start().starts_with("```") && l.replace(' ', "").contains("{shortcodes=false}"));
+        for (line_number, line) in segment.drain(..) {
             match (disabled, block_include(line)) {
                 (false, Some(target)) => self.retrieve(&target, out)?,
-                _ => out.push_str(line),
+                _ => self.append(out, line, &self.master.clone(), line_number),
             }
         }
         Ok(())
@@ -106,25 +156,26 @@ impl Expansion {
         if self.stack.contains(&path) {
             return Err(anyhow!("circular include of {target}"));
         }
-        let source = std::fs::read_to_string(&path)
+        self.edges.push(IncludeEdge { parent: self.stack.last().unwrap().clone(), file: path.clone() });
+        let source = (self.read)(&path)
             .with_context(|| format!("include {target}: could not read {}", path.display()))?;
         if !self.files.contains(&path) {
             self.files.push(path.clone());
         }
-        self.stack.push(path);
+        self.stack.push(path.clone());
 
         let mut start = 0;
         for (line_start, line_end) in line_ranges(&source) {
             if let Some(nested) = block_include(&source[line_start..line_end]) {
-                out.push_str(&source[start..line_start]);
+                self.append(out, &source[start..line_start], &path, source[..start].bytes().filter(|b| *b == b'\n').count());
                 start = line_end;
                 self.retrieve(&nested, out)?;
             }
         }
         if start != source.len() {
-            out.push_str(&source[start..]);
+            self.append(out, &source[start..], &path, source[..start].bytes().filter(|b| *b == b'\n').count());
         }
-        out.push_str(if source.ends_with('\n') { "\n" } else { "\n\n" });
+        self.append(out, if source.ends_with('\n') { "\n" } else { "\n\n" }, &path, source.lines().count().saturating_sub(1));
 
         self.stack.pop();
         Ok(())
@@ -249,6 +300,27 @@ mod tests {
         let out = expand(&std::fs::read_to_string(&master).unwrap(), &master).unwrap();
         // The include line, newline and all, becomes the file plus "\n".
         assert_eq!(out.text, "Intro.\n\nChapter one.\n\n\nOutro.\n");
+    }
+
+    #[test]
+    fn maps_nested_cells_to_their_actual_source_lines_and_keeps_edges() {
+        let dir = scratch("source-map");
+        write(&dir, "chapters/one.qmd", "## One\n\n{{< include two.qmd >}}\n");
+        let two = write(&dir, "two.qmd", "Nested prose.\n\n```{python}\nvalue = 42\n```\n");
+        let source = "Master.\n\n{{< include chapters/one.qmd >}}\n\nEnd.\n";
+        let master = write(&dir, "master.qmd", source);
+        let out = expand(source, &master).unwrap();
+        let cell = crate::cells::code_ranges(&out.text).remove(0);
+        let location = out.location_at_line(cell.start_line).unwrap();
+        assert_eq!(location.file, two);
+        assert_eq!(location.line, 2);
+        assert_eq!(out.edges[1].parent, dir.join("chapters/one.qmd"));
+        assert_eq!(out.edges[1].file, two);
+        let overlay = expand_with(source, &master, |file| {
+            if file == two { Ok("Changed unsaved text.\n".into()) } else { Ok(std::fs::read_to_string(file)?) }
+        }).unwrap();
+        assert!(overlay.text.contains("Changed unsaved text."));
+        assert!(std::fs::read_to_string(two).unwrap().contains("value = 42"));
     }
 
     #[test]

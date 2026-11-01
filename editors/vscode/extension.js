@@ -4,6 +4,108 @@ const net = require('node:net');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 let session;
+let sourcesView;
+const fileKey = file => process.platform === 'win32' ? file.toLowerCase().replace(/\\/g, '/') : file;
+
+class SourcesView {
+  constructor() { this.changed = new vscode.EventEmitter(); this.onDidChangeTreeData = this.changed.event; }
+  update(s, manifest) { this.s = s; this.manifest = manifest; this.changed.fire(); }
+  getChildren(item) {
+    if (!this.s || session !== this.s || !this.manifest?.root) return [];
+    if (!item) return [{ file: this.manifest.root }];
+    return (this.manifest.edges || []).filter(edge => fileKey(edge.parent) === fileKey(item.file)).map(edge => ({ file: edge.file }));
+  }
+  getTreeItem(item) {
+    const children = this.getChildren(item);
+    const result = new vscode.TreeItem(vscode.Uri.file(item.file), children.length ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
+    result.command = { command: 'qlive.revealSource', title: 'Open source', arguments: [{ file: item.file, line: 0 }] };
+    result.tooltip = item.file;
+    return result;
+  }
+}
+
+async function revealSource(s, source) {
+  if (session !== s || typeof source.file !== 'string' || !s.files.has(fileKey(source.file))) return;
+  const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(source.file));
+  const editor = await vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.One, preserveFocus: false });
+  const line = Math.max(0, Math.min(Number(source.line) || 0, doc.lineCount - 1));
+  editor.selection = new vscode.Selection(line, 0, line, 0);
+  editor.revealRange(new vscode.Range(line, 0, line, 0), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+}
+
+function native(request, uri) {
+  const executable = vscode.workspace.getConfiguration('qlive', uri).get('executable', 'qlive');
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, ['editor'], { windowsHide: true });
+    let output = '', errors = '';
+    const timer = setTimeout(() => { child.kill(); reject(new Error('Native editor operation timed out')); }, 10000);
+    child.stdout.on('data', chunk => { output += chunk; });
+    child.stderr.on('data', chunk => { errors += chunk; });
+    child.on('error', error => { clearTimeout(timer); reject(error); });
+    child.on('close', code => {
+      clearTimeout(timer);
+      try { if (code !== 0) throw new Error(errors || `qlive exited (${code})`); resolve(JSON.parse(output)); }
+      catch (error) { reject(error); }
+    });
+    child.stdin.on('error', () => {});
+    child.stdin.end(JSON.stringify(request));
+  });
+}
+
+async function navigate(direction) {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) return;
+  const version = editor.document.version;
+  const result = await native({ op: 'navigate', text: editor.document.getText(), line: editor.selection.active.line, direction }, editor.document.uri);
+  if (result.line === null || editor.document.version !== version) return;
+  editor.selection = new vscode.Selection(result.line, 0, result.line, 0);
+  editor.revealRange(new vscode.Range(result.line, 0, result.line, 0));
+}
+
+async function ready(s) {
+  if (s.connecting) return;
+  s.connecting = true;
+  for (let attempt = 0; attempt < 50 && session === s; attempt++) {
+    const listening = await new Promise(resolve => {
+      const socket = net.createConnection({ host: '127.0.0.1', port: s.port });
+      socket.once('connect', () => { socket.destroy(); resolve(true); });
+      socket.once('error', () => resolve(false));
+      socket.setTimeout(500, () => { socket.destroy(); resolve(false); });
+    });
+    if (listening && session === s) {
+      s.ready = true;
+      void flush(s);
+      showPreview(s);
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  if (session === s) {
+    s.status.text = '$(warning) qlive: Could not connect';
+    s.status.tooltip = 'The preview server did not become ready. See the qlive output channel.';
+  }
+}
+
+function showPreview(s) {
+  if (!s.ready || session !== s) return;
+  if (s.panel) {
+    s.panel.reveal(vscode.ViewColumn.Beside, true);
+    return;
+  }
+  const panel = s.panel = vscode.window.createWebviewPanel('qlive.preview',
+    `Preview — ${require('node:path').basename(s.doc.uri.fsPath)}`,
+    { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
+    { enableScripts: true, retainContextWhenHidden: true,
+      portMapping: [{ webviewPort: s.port, extensionHostPort: s.port }] });
+  panel.webview.html = `<!doctype html><html><head>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src http://127.0.0.1:${s.port}; style-src 'unsafe-inline'">
+    <style>html,body,iframe{width:100%;height:100%;margin:0;padding:0;border:0;overflow:hidden}body{background:white}</style>
+    </head><body><iframe title="Quarto live preview" src="http://127.0.0.1:${s.port}/"></iframe></body></html>`;
+  panel.onDidDispose(() => {
+    s.panel = undefined;
+    if (session === s) stop();
+  });
+}
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -39,7 +141,10 @@ function stop() {
   if (!session) return;
   const s = session;
   session = undefined;
+  sourcesView?.changed.fire();
+  void vscode.commands.executeCommand('setContext', 'qlive.previewRunning', false);
   clearTimeout(s.timer);
+  if (s.panel) s.panel.dispose();
   if (s.child.pid && s.child.exitCode === null) {
     if (process.platform === 'win32') {
       // The daemon owns pandoc and (for executable documents) a kernel worker.
@@ -83,14 +188,24 @@ function schedule(doc) {
 }
 
 function activate(context) {
+  sourcesView = new SourcesView();
+  context.subscriptions.push(sourcesView.changed, vscode.window.registerTreeDataProvider('qlive.includes', sourcesView));
+  const quarto = vscode.extensions.getExtension('quarto.quarto');
+  const integrated = Object.values(quarto?.packageJSON?.contributes?.menus || {}).some(entries => entries.some(entry => entry.command === 'qlive.start'));
+  void vscode.commands.executeCommand('setContext', 'qlive.quartoPreviewIntegrated', integrated);
   const output = vscode.window.createOutputChannel('qlive');
   context.subscriptions.push(output);
-  context.subscriptions.push(vscode.commands.registerCommand('qlive.start', async () => {
-    const doc = vscode.window.activeTextEditor?.document;
+  context.subscriptions.push(vscode.commands.registerCommand('qlive.start', async resource => {
+    const doc = resource?.scheme === 'file' ? await vscode.workspace.openTextDocument(resource) : vscode.window.activeTextEditor?.document;
     if (!doc || doc.uri.scheme !== 'file' || !/\.(qmd|md)$/i.test(doc.uri.fsPath)) {
       return vscode.window.showErrorMessage('Open a saved .qmd or .md file first.');
     }
     if (!vscode.workspace.isTrusted) return;
+    if (session?.doc.uri.toString() === doc.uri.toString()) {
+      schedule(doc);
+      showPreview(session);
+      return;
+    }
     stop();
     try {
       await vscode.workspace.fs.stat(doc.uri);
@@ -104,17 +219,30 @@ function activate(context) {
       status.command = 'qlive.open';
       status.text = '$(sync~spin) qlive: Starting';
       status.show();
-      const s = session = { doc, child, port, token, status, output, pending: doc.getText(), ready: false };
+      const s = session = { doc, child, port, token, status, output, pending: doc.getText(), ready: false,
+        files: new Set([fileKey(doc.uri.fsPath)]), lines: '' };
+      void vscode.commands.executeCommand('setContext', 'qlive.previewRunning', true);
       let startup = '';
       child.stdout.on('data', chunk => {
         output.append(chunk.toString());
+        s.lines += chunk.toString();
+        let end;
+        while ((end = s.lines.indexOf('\n')) >= 0) {
+          const line = s.lines.slice(0, end).trim();
+          s.lines = s.lines.slice(end + 1);
+          try {
+            if (line.startsWith('QLIVE_SOURCES ')) {
+              const manifest = JSON.parse(line.slice('QLIVE_SOURCES '.length));
+              s.files = new Set(manifest.files.map(fileKey));
+              if (session === s) sourcesView.update(s, manifest);
+            } else if (line.startsWith('QLIVE_REVEAL ')) {
+              void revealSource(s, JSON.parse(line.slice('QLIVE_REVEAL '.length))).catch(error => output.appendLine(error.message));
+            }
+          } catch (error) { output.appendLine(`Source mapping: ${error.message}`); }
+        }
         startup = (startup + chunk.toString()).slice(-2000);
         if (!s.ready && startup.includes(`http://127.0.0.1:${port}/`)) {
-          s.ready = true;
-          if (session === s) {
-            void flush(s);
-            void vscode.env.openExternal(vscode.Uri.parse(`http://127.0.0.1:${port}/`));
-          }
+          void ready(s);
         }
       });
       child.stderr.on('data', chunk => output.append(chunk.toString()));
@@ -132,8 +260,36 @@ function activate(context) {
     } catch (error) { void vscode.window.showErrorMessage(`Cannot start qlive: ${error.message}`); }
   }));
   context.subscriptions.push(vscode.commands.registerCommand('qlive.stop', stop));
+  context.subscriptions.push(vscode.commands.registerCommand('qlive.revealSource', source => session && revealSource(session, source)));
+  const command = (name, action) => context.subscriptions.push(vscode.commands.registerCommand(name, async () => {
+    try { await action(); } catch (error) { void vscode.window.showErrorMessage(`qlive: ${error.message}`); }
+  }));
+  command('qlive.goToNextCell', () => navigate('next'));
+  command('qlive.goToPreviousCell', () => navigate('previous'));
+  command('qlive.insertCodeCell', async () => {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) return;
+    const version = editor.document.version;
+    const edit = await native({ op: 'insert-cell', text: editor.document.getText(), line: editor.selection.active.line }, editor.document.uri);
+    if (editor.document.version !== version) return;
+    if (await editor.edit(builder => builder.insert(editor.document.positionAt(edit.offset), edit.text))) {
+      const cursor = editor.document.positionAt(edit.cursorOffset);
+      editor.selection = new vscode.Selection(cursor, cursor);
+      editor.revealRange(new vscode.Range(cursor, cursor));
+    }
+  });
+  command('qlive.newDocument', async () => {
+    const result = await native({ op: 'new-document' });
+    await vscode.window.showTextDocument(await vscode.workspace.openTextDocument({ language: 'quarto', content: result.text }));
+  });
   context.subscriptions.push(vscode.commands.registerCommand('qlive.open', () => {
+    if (session) showPreview(session);
+  }));
+  context.subscriptions.push(vscode.commands.registerCommand('qlive.openExternal', () => {
     if (session?.ready) return vscode.env.openExternal(vscode.Uri.parse(`http://127.0.0.1:${session.port}/`));
+  }));
+  context.subscriptions.push(vscode.commands.registerCommand('qlive.refresh', () => {
+    if (session) schedule(session.doc);
   }));
   context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(event => schedule(event.document)));
   context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(schedule));

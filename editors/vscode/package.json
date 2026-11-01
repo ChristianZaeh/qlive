@@ -2,18 +2,43 @@
   "name": "qlive-preview",
   "displayName": "qlive Preview",
   "description": "Quarto preview from unsaved editor buffers",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "publisher": "qlive-local",
   "engines": { "vscode": "^1.85.0" },
   "main": "./extension.js",
-  "activationEvents": ["onCommand:qlive.start"],
+  "activationEvents": ["onStartupFinished", "onCommand:qlive.start"],
   "capabilities": { "untrustedWorkspaces": { "supported": false } },
   "contributes": {
     "commands": [
-      { "command": "qlive.start", "title": "qlive: Start Live Preview" },
-      { "command": "qlive.stop", "title": "qlive: Stop Live Preview" },
-      { "command": "qlive.open", "title": "qlive: Open Preview in Browser" }
+      { "command": "qlive.start", "title": "Preview", "category": "qlive", "icon": "$(preview)", "actionBarOptions": { "controlType": "button", "displayTitle": true } },
+      { "command": "qlive.stop", "title": "Stop Live Preview", "category": "qlive", "icon": "$(debug-stop)" },
+      { "command": "qlive.open", "title": "Show Preview", "category": "qlive", "icon": "$(preview)" },
+      { "command": "qlive.openExternal", "title": "Open Preview in Browser", "category": "qlive", "icon": "$(link-external)" },
+      { "command": "qlive.refresh", "title": "Refresh Preview", "category": "qlive", "icon": "$(refresh)" },
+      { "command": "qlive.revealSource", "title": "Go to Source", "category": "qlive" },
+      { "command": "qlive.insertCodeCell", "title": "Insert Code Cell", "category": "qlive" },
+      { "command": "qlive.goToNextCell", "title": "Go to Next Cell", "category": "qlive" },
+      { "command": "qlive.goToPreviousCell", "title": "Go to Previous Cell", "category": "qlive" },
+      { "command": "qlive.newDocument", "title": "New Quarto Document", "category": "qlive" }
     ],
+    "views": { "explorer": [{ "id": "qlive.includes", "name": "Quarto Sources", "when": "qlive.previewRunning" }] },
+    "keybindings": [
+      { "command": "qlive.start", "key": "ctrl+shift+k", "mac": "cmd+shift+k", "when": "editorTextFocus && (resourceExtname == .qmd || resourceExtname == .md)" },
+      { "command": "qlive.insertCodeCell", "key": "ctrl+shift+i", "mac": "cmd+shift+i", "when": "editorTextFocus && resourceExtname == .qmd" },
+      { "command": "qlive.goToNextCell", "key": "ctrl+pagedown", "mac": "cmd+pagedown", "when": "editorTextFocus && resourceExtname == .qmd" },
+      { "command": "qlive.goToPreviousCell", "key": "ctrl+pageup", "mac": "cmd+pageup", "when": "editorTextFocus && resourceExtname == .qmd" }
+    ],
+    "menus": {
+      "editor/title": [
+        { "command": "qlive.start", "when": "!qlive.quartoPreviewIntegrated && resourceScheme == file && (resourceExtname == .qmd || resourceExtname == .md)", "group": "navigation@1" },
+        { "command": "qlive.refresh", "when": "activeWebviewPanelId == qlive.preview", "group": "navigation@1" },
+        { "command": "qlive.openExternal", "when": "activeWebviewPanelId == qlive.preview", "group": "navigation@2" },
+        { "command": "qlive.stop", "when": "activeWebviewPanelId == qlive.preview", "group": "navigation@3" }
+      ],
+      "editor/title/run": [
+        { "command": "qlive.start", "when": "!qlive.quartoPreviewIntegrated && resourceScheme == file && (resourceExtname == .qmd || resourceExtname == .md)" }
+      ]
+    },
     "configuration": {
       "title": "qlive",
       "properties": {

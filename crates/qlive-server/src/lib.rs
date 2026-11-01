@@ -26,6 +26,8 @@ pub const CLIENT_JS: &str = include_str!("../assets/client.js");
 #[derive(Clone)]
 pub struct Preview {
     editor: Option<editor::Editor>,
+    sources: Arc<RwLock<Vec<serde_json::Value>>>,
+    source_manifest: Arc<RwLock<serde_json::Value>>,
     root: PathBuf,
     entry: String,
     tx: broadcast::Sender<String>,
@@ -40,6 +42,8 @@ impl Preview {
         let (tx, _rx) = broadcast::channel(16);
         Self {
             editor: None,
+            sources: Arc::new(RwLock::new(Vec::new())),
+            source_manifest: Arc::new(RwLock::new(serde_json::Value::Null)),
             root,
             entry,
             tx,
@@ -67,8 +71,22 @@ impl Preview {
         let _ = self.tx.send(message.to_string());
     }
 
+    pub fn send_block(&self, id: &str, html: &str) {
+        let message = serde_json::json!({"v": 1, "ops": [{"op": "replace", "id": id, "html": html}]});
+        let _ = self.tx.send(message.to_string());
+    }
+
     pub fn entry(&self) -> &str {
         &self.entry
+    }
+
+    pub fn set_sources(&self, sources: Vec<serde_json::Value>, manifest: serde_json::Value) {
+        if let Ok(mut current) = self.sources.write() { *current = sources; }
+        if self.editor.is_some() {
+            if let Ok(mut current) = self.source_manifest.write() {
+                if *current != manifest { println!("QLIVE_SOURCES {manifest}"); *current = manifest; }
+            }
+        }
     }
 }
 
@@ -80,6 +98,7 @@ pub async fn serve(preview: Preview, port: u16) -> Result<()> {
         .route("/qlive/client.js", get(client_js))
         .route("/qlive/ws", get(ws_upgrade))
         .route("/qlive/buffer", axum::routing::post(editor::update))
+        .route("/qlive/reveal", axum::routing::post(editor::reveal))
         .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
         .route("/*path", get(file))
         .with_state(state);

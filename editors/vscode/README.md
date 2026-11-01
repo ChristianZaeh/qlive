@@ -1,9 +1,12 @@
 # qlive for VS Code
 
-Run **qlive: Start Live Preview** from the command palette with a saved `.qmd` or
-`.md` file open. The extension starts qlive and opens the browser preview. Typing
+Click **Preview**, press **Ctrl+Shift+K** (**Cmd+Shift+K** on macOS), or run
+**qlive: Preview** with a saved `.qmd` or `.md` file open. The extension starts the
+Rust qlive daemon and opens a side-by-side preview panel. Typing
 updates the preview without saving. The status bar reports updates and when a save
-is needed. Use **qlive: Stop Live Preview** to stop its daemon.
+is needed. The panel toolbar provides refresh, open-in-browser, and stop controls.
+Repeated Preview presses reveal the existing session. Closing the panel stops its
+daemon and child processes.
 
 Set `qlive.executable` to the built qlive binary (for this checkout,
 `C:\dev\qlive\target\debug\qlive.exe`). `qlive.debounceMs` defaults to 100 ms.
@@ -21,7 +24,29 @@ continue. Dependencies use Python name analysis with qlive's documented limits;
 an unparseable cell conservatively blocks later cells.
 
 Build and install the local VSIX with `python editors/vscode/package.py`, then
-`code --install-extension editors/vscode/qlive-preview-0.1.0.vsix --force`.
+`code --install-extension editors/vscode/qlive-preview-0.3.0.vsix --force`.
+
+To route the installed Quarto extension's existing Preview menus and shortcut into
+qlive, run `python editors/vscode/integrate_quarto.py <installed-quarto-extension-dir>`
+and reload VS Code. This modifies only its contributed menus/keybinding, keeps a
+`package.json.qlive-backup`, and leaves other Quarto commands available. The qlive
+extension hides its duplicate button when this integration is detected. Run the
+script again after Quarto extension updates; pass `--restore` to undo it.
+
+The **Quarto Sources** tree shows the master and nested includes. Clicking a rendered
+cell's output opens its producing file and first code line. Links and copy controls
+retain their normal actions. Rust also provides insert-cell, next/previous-cell and
+new-document commands. Integration redirects the corresponding existing cell controls.
+
+Ordinary single-paragraph edits use a block patch. Structural edits, citations,
+math, raw HTML, lists and custom filters use the whole-document path. See the
+repository's `paragraph-benchmark.md` for measured transport timings; they exclude
+typing debounce and browser paint. Cursor-jump protocol tests passed; the final
+interactive cursor-jump check was interrupted by the user.
+
+This is a Rust-backed replacement for the preview workflow. The full authoring
+extension port is tracked in [ROADMAP.md](ROADMAP.md); language and authoring tools
+are still provided by the installed Quarto extension.
 
 Validation:
 

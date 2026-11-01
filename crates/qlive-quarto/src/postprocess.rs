@@ -4,8 +4,12 @@
 
 use kuchiki::{traits::TendrilSink, NodeRef};
 
+mod appendix;
+pub use appendix::Appendix;
+
 #[derive(Debug, Clone)]
 pub struct Options {
+    pub appendix: Option<Appendix>,
     pub bootstrap: bool,
     pub annotations: String,
     pub anchors: bool,
@@ -16,6 +20,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            appendix: None,
             bootstrap: true,
             annotations: "default".into(),
             anchors: true,
@@ -33,6 +38,10 @@ impl Options {
         if let Some((_, encoded)) = env.iter().find(|(key, _)| key == "QUARTO_FILTER_PARAMS") {
             let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
             let params: serde_json::Value = serde_json::from_slice(&bytes)?;
+            if let Some(appendix) = &mut options.appendix {
+                appendix.language(&params["language"]);
+                appendix.results_file = params["results-file"].as_str().map(Into::into);
+            }
             if let Some(bootstrap) = params["has-bootstrap"].as_bool() {
                 options.bootstrap = bootstrap;
             }
@@ -53,6 +62,7 @@ impl Options {
             _ => !minimal,
         };
         Ok(Self {
+            appendix: Appendix::from_metadata(&value),
             bootstrap: !matches!(value["theme"].as_str(), Some("none" | "pandoc")),
             annotations: match &value["code-annotations"] {
                 serde_yaml::Value::Bool(false) => "false".into(),
@@ -66,6 +76,13 @@ impl Options {
                 .unwrap_or("Copy to Clipboard")
                 .into(),
         })
+    }
+
+    /// Metadata-only appendix content is stable until front matter triggers a cold render.
+    /// Dynamic footnotes, references and authored appendices are never copied here.
+    pub fn with_cold_page(mut self, page: &str) -> Self {
+        if let Some(appendix) = &mut self.appendix { appendix.capture_static(page); }
+        self
     }
 }
 
@@ -332,6 +349,14 @@ pub fn process(body: &str, options: &Options) -> String {
             parent.detach();
             scaffold.prepend(parent.clone());
         }
+        if let Some(source) = attr(&parent, "data-code-preview").filter(|s| !s.is_empty()) {
+            let frame = element("<iframe></iframe>");
+            if let Some(classes) = attr(&pre, "class") { set_attr(&frame, "class", &classes); }
+            let source = source.strip_suffix(".qmd").map(|s| format!("{s}.html")).unwrap_or(source);
+            set_attr(&frame, "src", &source);
+            parent.as_element().unwrap().attributes.borrow_mut().remove("data-code-preview");
+            parent.append(frame);
+        }
     }
     if options.anchors {
         for node in nodes(
@@ -345,7 +370,30 @@ pub fn process(body: &str, options: &Options) -> String {
             }
         }
     }
+    for number in nodes(&doc, ".header-section-number") {
+        if previous_element(&number).is_some_and(|n| has_class(&n, "toc-section-number")) { number.detach(); }
+    }
     code_annotations(&doc, &options.annotations);
+    for table in nodes(&doc, "table[data-quarto-postprocess=true]") {
+        if attr(&table, "data-quarto-disable-processing").as_deref() == Some("true") { continue; }
+        {
+            let el = table.as_element().unwrap();
+            let mut attrs = el.attributes.borrow_mut();
+            attrs.remove("data-quarto-postprocess");
+            attrs.remove("data-quarto-disable-processing");
+        }
+        for row in nodes(&table, "tr") {
+            for cell in row.children().collect::<Vec<_>>() {
+                if !cell.as_element().is_some_and(|e| matches!(e.name.local.as_ref(), "th" | "td")) { continue; }
+                let replacement = element(if attr(&cell, "data-quarto-table-cell-role").as_deref() == Some("th") { "<table><tbody><tr><th></th></tr></tbody></table>" } else { "<table><tbody><tr><td></td></tr></tbody></table>" });
+                let replacement = nodes(&replacement, "th, td").remove(0);
+                *replacement.as_element().unwrap().attributes.borrow_mut() = cell.as_element().unwrap().attributes.borrow().clone();
+                for child in cell.children() { replacement.append(child); }
+                cell.insert_before(replacement);
+                cell.detach();
+            }
+        }
+    }
     if options.bootstrap {
         bootstrap_classes(&doc);
     }
@@ -375,6 +423,9 @@ pub fn process(body: &str, options: &Options) -> String {
                 break;
             }
         }
+    }
+    if options.bootstrap {
+        if let Some(appendix) = &options.appendix { appendix.process(&doc); }
     }
     inner_html(&nodes(&doc, "body").remove(0))
 }

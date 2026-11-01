@@ -7,6 +7,17 @@
   var KEY = "qlive:scroll";
   var badge = null;
 
+  document.addEventListener("click", function (event) {
+    if (!event.target || !event.target.closest) return;
+    if (event.target.closest("a, button, input, select, textarea, summary")) return;
+    var source = event.target.closest("[data-qlive-source]");
+    if (!source) return;
+    fetch("/qlive/reveal", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: Number(source.getAttribute("data-qlive-source")) }) })
+      .then(function (response) { if (response.ok) showBadge("source opened", 900); })
+      .catch(function () {});
+  });
+
   function showBadge(text, ms) {
     if (!badge) {
       badge = document.createElement("div");
@@ -100,7 +111,7 @@
     var applied = 0;
     patch.ops.forEach(function (op) {
       var node = document.querySelector('[data-qlive-id="' + op.id + '"]');
-      if (!node) return;
+      if (!node) { location.reload(); return; }
       if (op.op === "replace" && typeof op.html === "string") {
         node.outerHTML = op.html;
         applied++;
@@ -110,6 +121,7 @@
       }
     });
     showBadge(applied + " block" + (applied === 1 ? "" : "s"), 900);
+    window.__qliveBlockPatches = (window.__qliveBlockPatches || 0) + applied;
   }
 
   connect();

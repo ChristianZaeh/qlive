@@ -53,3 +53,12 @@ pub(crate) async fn update(State(state): State<Arc<Preview>>, headers: HeaderMap
         _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
+
+pub(crate) async fn reveal(State(state): State<Arc<Preview>>, Json(value): Json<Value>) -> Response {
+    if state.editor.is_none() { return StatusCode::NOT_FOUND.into_response(); }
+    let Some(id) = value["id"].as_u64().and_then(|id| usize::try_from(id).ok()) else { return StatusCode::BAD_REQUEST.into_response() };
+    let source = state.sources.read().ok().and_then(|sources| sources.get(id).cloned());
+    let Some(source) = source else { return StatusCode::NOT_FOUND.into_response() };
+    println!("QLIVE_REVEAL {source}");
+    Json(json!({"status": "revealed"})).into_response()
+}

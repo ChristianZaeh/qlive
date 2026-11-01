@@ -97,12 +97,21 @@ qlive cells F [--once]        execute only the cells that changed
 ### `qlive live`: preview without reloads
 
 For **preview while typing without saving**, install the local
-[VS Code extension](editors/vscode/README.md) and run **qlive: Start Live Preview**.
+[VS Code extension](editors/vscode/README.md) and click **Preview** or press
+**Ctrl+Shift+K**. It opens a side-by-side panel with refresh, stop and browser controls.
 It streams the active document's buffer to a token-authenticated loopback endpoint,
 debounces edits by 100 ms, and patches the preview using the warm pipeline. Prose
 edits reuse existing cell outputs. Code and front-matter changes require a save.
 Only the preview's source document is streamed; included files still come from disk.
 This is the initial M3 path, with no claim yet of sub-50-ms keystroke latency.
+
+The **Quarto Sources** tree shows nested includes. Clicking a rendered cell output
+opens the file and first code line that produced it. Single ordinary paragraph edits
+use a guarded block render and WebSocket patch; structural/global-feature edits use
+the full pipeline. The [300-section benchmark](paragraph-benchmark.md) measured
+63 ms median per paragraph buffer request versus 384 ms for a structural request,
+excluding editor debounce and browser paint. The worker-only parity check measured
+23 ms versus 273 ms and confirmed identical HTML over five edits.
 
 One cold `quarto render` (with capture) yields the full page, its shell, and Quarto's
 pipeline to host warm. Each save then re-renders the body through Quarto's own reader
@@ -416,8 +425,20 @@ Captured metadata controls `minimal`, `anchor-sections` and `code-copy`; capture
 language parameters supply the localized copy-button tooltip. Comparison now uses
 DOM serialization and preserves whitespace inside code and preformatted elements.
 The captured `has-bootstrap` flag gates Bootstrap rules, including section heading
-ids. Column layout, table cell/width processing and appendix processing remain open.
+ids. Dynamic footnotes, references and authored appendices are moved into Quarto's
+appendix layout; metadata-only citation/license/copyright sections are reused from
+the cold page. Table cell roles, code-preview frames and duplicate section numbers
+are also postprocessed. Column layout, citation processing and writer-option parity
+(including table widths) remain open.
 The historical full-corpus results below predate M7 and its stricter comparator.
+
+The [M7 full run](m7-parity-full.md), corpus revision `3977c9d`, measured **403 pass,
+39 fail, 27 error, 1 fallback out of 470**. It predates the embed/nested-cell skip fix;
+some embedded renders attempted kernel startup, so it is not a no-execution run.
+The corrected corpus command skips embeds and executable fences nested in divs,
+and passes `--no-execute` to Quarto. Its [safe 50-document sample](m7-parity-safe-50.md)
+has **44 pass, 6 fail, 0 error**. Eligibility changed, so the samples are not directly
+comparable. The full-corpus parity gate remains open.
 
 The initial anchors/copy slice had **29 pass, 17 fail, 4 error** in the first 50
 eligible corpus documents. See [the latest M7 sample report](m7-parity-50.md) for

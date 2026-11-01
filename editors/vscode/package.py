@@ -28,6 +28,6 @@ target = root / f"qlive-preview-{version}.vsix"
 with ZipFile(target, "w", ZIP_DEFLATED) as archive:
     archive.writestr("[Content_Types].xml", types)
     archive.writestr("extension.vsixmanifest", manifest)
-    for name in ["package.json", "extension.js", "README.md"]:
+    for name in ["package.json", "extension.js", "README.md", "ROADMAP.md"]:
         archive.write(root / name, f"extension/{name}")
 print(target)

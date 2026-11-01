@@ -7,7 +7,9 @@
 pub mod capture;
 pub mod engine;
 pub mod inspect;
+pub mod incremental;
 pub mod shell;
+pub mod sourcemap;
 pub mod postprocess;
 
 pub use capture::Capture;
