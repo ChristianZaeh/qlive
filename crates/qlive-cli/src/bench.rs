@@ -86,9 +86,32 @@ pub fn run(doc: Option<PathBuf>, iters: usize, sections: usize, pandoc_port: u16
         server.convert(&block, "markdown", "html")?;
         single += elapsed_ms(started);
     }
-    let per_block = single / iters as f64;
-    row("pandoc server, one block", per_block);
+    let per_block_http = single / iters as f64;
+    row("pandoc server, one block", per_block_http);
     drop(server);
+
+    // ---- warm pandoc lua worker: same pandoc, no HTTP hop --------------------
+    let mut worker = qlive_pandoc::LuaWorker::start(&tools.pandoc)?;
+
+    worker.render(&source, "markdown", "html")?; // warm up
+    let mut whole_lua = 0.0;
+    for _ in 0..iters {
+        let started = Instant::now();
+        worker.render(&source, "markdown", "html")?;
+        whole_lua += elapsed_ms(started);
+    }
+    row("pandoc lua worker, whole doc", whole_lua / iters as f64);
+
+    worker.render(&block, "markdown", "html")?; // warm up
+    let mut single_lua = 0.0;
+    for _ in 0..iters {
+        let started = Instant::now();
+        worker.render(&block, "markdown", "html")?;
+        single_lua += elapsed_ms(started);
+    }
+    let per_block = single_lua / iters as f64;
+    row("pandoc lua worker, one block", per_block);
+    drop(worker);
 
     // ---- typst ---------------------------------------------------------------
     match &tools.typst {

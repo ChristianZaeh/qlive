@@ -867,6 +867,7 @@ name = "qlive-pandoc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "qlive-core",
  "serde_json",
  "ureq",
 ]

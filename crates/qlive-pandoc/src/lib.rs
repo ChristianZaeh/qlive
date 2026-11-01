@@ -8,11 +8,13 @@
 //! | `pandoc server` HTTP, one block        | 6–9 ms      |
 //! | `pandoc lua` in-process, one block     | ~3.9 ms     |
 //!
-//! M0 uses [`PandocServer`], which is simple and already 60× better than a cold
-//! process. It is sandboxed, though, so it cannot run Quarto's Lua filters — that is
-//! why [`lua`] exists as the M1 target.
+//! [`PandocServer`] is simple, and sandboxed: it cannot run Lua filters at all.
+//! [`lua::LuaWorker`] is faster and *can* host Quarto's filter chain, which is why it
+//! is the path forward — see that module for what the chain requires.
 
 pub mod lua;
+
+pub use lua::LuaWorker;
 
 use anyhow::{anyhow, Result};
 use std::net::TcpStream;

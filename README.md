@@ -37,19 +37,25 @@ clock. A run taken next to a game and a browser came out 2–16× worse across t
 (55 s for the cold `quarto render`, 10.8 s for a one-shot typst compile), which says
 nothing about either tool.
 
-### M0 result
+### Bench result
 
 `qlive bench`, 283-line fixture, 121 blocks, 20 warm iterations, **idle machine**:
 
 | step | ms |
 |---|---:|
-| quarto render --to html (cold, Deno included) | 1905.8 |
-| pandoc one-shot, whole doc (process start) | 74.1 |
-| pandoc server, whole doc | 23.5 |
-| pandoc server, one block | **1.2** |
-| typst compile, one-shot (process start) | 253.0 |
-| typst watch, edit -> new PDF (end to end) | 132.5 |
-| &nbsp;&nbsp;of which typst reports as compile | **3.1** |
+| quarto render --to html (cold, Deno included) | 2087.7 |
+| pandoc one-shot, whole doc (process start) | 69.6 |
+| pandoc server, whole doc | 23.0 |
+| pandoc server, one block | 1.1 |
+| **pandoc lua worker, whole doc** | **19.7** |
+| **pandoc lua worker, one block** | **0.7** |
+| typst compile, one-shot (process start) | 89.2 |
+| typst watch, edit -> new PDF (end to end) | 137.4 |
+| &nbsp;&nbsp;of which typst reports as compile | **2.6** |
+
+The `pandoc lua` worker beats `pandoc server` on both sizes and, unlike the sandboxed
+server, can host Lua filters — so it is the path forward. Inside Lua, pandoc's own
+`read` + `write` for one block measures 0.52 ms; 0.7 ms is the round trip from Rust.
 
 > A one-word edit dirties 1 of 121 blocks.
 
@@ -184,8 +190,9 @@ working `as` and `dlltool`.
 
 | # | Scope | Gate |
 |---|---|---|
-| **M0** | this scaffold: bench + cold render + watch + reload | a save costs one `quarto render`, not a `quarto preview` restart |
-| **M1** | `pandoc lua` worker, whole-document warm passes | p50 under 200 ms on a 300-line doc |
+| **M0** | scaffold: bench + cold render + watch + reload | **done** |
+| **M5a** | per-cell execution (`qlive cells`) | **done**: cell edit runs one cell, prose edit runs none |
+| **M1** | `pandoc lua` worker, whole-document warm passes | **worker done** (0.7 ms/block); filter chain specified, not wired |
 | **M2** | block rendering + DOM patching, `data-qlive-id` | p50 under 25 ms; HTML identical to `quarto render` on a 50-doc corpus |
 | **M3** | VS Code buffer streaming, no save needed | keystroke → pixel under 50 ms p95 |
 | **M4** | typst as a library, per-page SVG patches | under 30 ms per edit |
@@ -195,3 +202,23 @@ The hard part is not speed. Quarto's Lua filter runtime is undocumented and
 version-coupled, so M1 onwards must pin a Quarto version and gate every commit on a
 corpus test that diffs qlive's HTML against `quarto render`'s. Fast and approximately
 right is worse than slow.
+
+### What the filter chain needs (probed)
+
+Running Quarto's own filters under a plain pandoc works, and needs all of:
+
+* `--data-dir <quarto>/share/pandoc/datadir` — its `init.lua` defines `param` and the
+  `quarto.*` globals, and reads `QUARTO_FILTER_PARAMS` unconditionally
+* `--from <quarto>/share/filters/qmd-reader.lua` — the filters consume
+  `quarto_pandoc_reader_opts` from metadata, which only Quarto's reader injects, so
+  `-f markdown` fails inside the `Meta` handler
+* `--lua-filter main.lua`, with the filters directory resolvable for `require`
+  (`modules/…` is relative)
+* env: `QUARTO_SHARE_PATH`, `QUARTO_FILTER_DEPENDENCY_FILE`, and
+  `QUARTO_FILTER_PARAMS` = base64 JSON needing at least `quarto-filters.entryPoints`,
+  `results-file`, `active-filters`
+
+Each missing piece surfaces as one precise Lua error, so the set is enumerable — five
+layers in six attempts. But that params object is Quarto's internal contract, so the
+robust approach is to **capture a real render's pandoc invocation** and replay it warm,
+rather than reconstruct it by hand.
