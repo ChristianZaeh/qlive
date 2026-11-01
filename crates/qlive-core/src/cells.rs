@@ -34,7 +34,7 @@ impl Cell {
 }
 
 /// What one cell execution produced, as nbformat outputs.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CellOutputs {
     pub outputs: Vec<Value>,
     pub execution_count: Option<i64>,

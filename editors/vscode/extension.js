@@ -77,6 +77,7 @@ async function ready(s) {
       s.ready = true;
       void flush(s);
       showPreview(s);
+      void updateKernelButton();
       return;
     }
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -214,6 +215,8 @@ function stop() {
     } else s.child.kill();
   }
   s.status.dispose();
+  // The kept kernel outlives the preview; show its state once qlive is gone.
+  setTimeout(() => void updateKernelButton(), 1500);
 }
 
 async function flush(s) {
@@ -250,6 +253,74 @@ function schedule(doc, dirty = doc.isDirty) {
   clearTimeout(s.timer);
   const delay = vscode.workspace.getConfiguration('qlive', doc.uri).get('debounceMs', 100);
   s.timer = setTimeout(() => void flush(s), delay);
+}
+
+// The Python kernel `qlive live` keeps running between previews. A status-bar button
+// shows it for the active document and starts or stops it through `qlive kernels`.
+let kernelButton;
+let kernelOutput;
+let kernelBusy = false;
+const hasPythonCells = doc => /^\s*`{3,}\s*\{python\b/m.test(doc.getText());
+
+function kernels(uri, args) {
+  const executable = vscode.workspace.getConfiguration('qlive', uri).get('executable', 'qlive');
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, ['kernels', ...args], { windowsHide: true });
+    let out = '', err = '';
+    child.stdout.on('data', chunk => out += chunk);
+    child.stderr.on('data', chunk => err += chunk);
+    child.on('error', reject);
+    child.on('close', code => code === 0 ? resolve(out) : reject(new Error((err || out).trim() || `qlive kernels exited (${code})`)));
+  });
+}
+
+function kernelDocument() {
+  const doc = vscode.window.activeTextEditor?.document;
+  return doc && doc.uri.scheme === 'file' && /\.qmd$/i.test(doc.uri.fsPath) && hasPythonCells(doc) ? doc : undefined;
+}
+
+async function kernelRunning(doc) {
+  const list = JSON.parse((await kernels(doc.uri, ['--json', doc.uri.fsPath])).trim() || '[]');
+  return list.some(kernel => kernel.state === 'running');
+}
+
+async function updateKernelButton() {
+  if (!kernelButton || kernelBusy) return;
+  const doc = kernelDocument();
+  if (!doc || !vscode.workspace.isTrusted) { kernelButton.hide(); return; }
+  try {
+    const running = await kernelRunning(doc);
+    if (kernelBusy || kernelDocument() !== doc) return;
+    kernelButton.text = running ? '$(debug-stop) Kernel' : '$(play) Kernel';
+    kernelButton.tooltip = running
+      ? 'This document\'s Python kernel is running and keeps its variables between previews. Click to stop it and free its memory (a preview using it closes too).'
+      : 'Start this document\'s Python kernel and run its saved cells, so the next preview starts without recomputing.';
+    kernelButton.show();
+  } catch { kernelButton.hide(); }
+}
+
+async function toggleKernel() {
+  const doc = kernelDocument();
+  if (!doc || kernelBusy || !vscode.workspace.isTrusted) return;
+  kernelBusy = true;
+  try {
+    if (await kernelRunning(doc)) {
+      kernelButton.text = '$(sync~spin) Kernel: stopping';
+      // A preview of this document holds the kernel's only connection.
+      if (session?.files.has(fileKey(doc.uri.fsPath))) stop();
+      kernelOutput?.append(await kernels(doc.uri, ['--stop', doc.uri.fsPath]));
+    } else {
+      kernelButton.text = '$(sync~spin) Kernel: running cells';
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'qlive: starting the Python kernel and running the saved cells' },
+        async () => kernelOutput?.append(await kernels(doc.uri, ['--start', doc.uri.fsPath])));
+    }
+  } catch (error) {
+    void vscode.window.showErrorMessage(`qlive kernel: ${error.message}`);
+  } finally {
+    kernelBusy = false;
+    void updateKernelButton();
+  }
 }
 
 function activate(context) {
@@ -352,6 +423,19 @@ function activate(context) {
   const command = (name, action) => context.subscriptions.push(vscode.commands.registerCommand(name, async () => {
     try { await action(); } catch (error) { void vscode.window.showErrorMessage(`qlive: ${error.message}`); }
   }));
+  kernelOutput = output;
+  kernelButton = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 49);
+  kernelButton.command = 'qlive.toggleKernel';
+  context.subscriptions.push(kernelButton);
+  command('qlive.toggleKernel', toggleKernel);
+  command('qlive.stopAllKernels', async () => {
+    output.append(await kernels(undefined, ['--stop']));
+    void updateKernelButton();
+  });
+  context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(() => void updateKernelButton()));
+  const kernelPoll = setInterval(() => void updateKernelButton(), 20000);
+  context.subscriptions.push({ dispose: () => clearInterval(kernelPoll) });
+  void updateKernelButton();
   command('qlive.goToNextCell', () => navigate('next'));
   command('qlive.goToPreviousCell', () => navigate('previous'));
   command('qlive.insertCodeCell', async () => {

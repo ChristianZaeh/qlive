@@ -92,6 +92,7 @@ qlive bench [--doc F]         print the latency table for this machine
 qlive live F [--port N] [--fresh]  live preview: warm Quarto renders, pushed without reload
 qlive preview F [--port N]    cold render once, then re-render on save (M0)
 qlive cells F [--once]        execute only the cells that changed
+qlive kernels [F] [--start | --stop] [--json]   list, start or stop kept Python kernels
 ```
 
 ### `qlive live`: preview without reloads
@@ -258,6 +259,39 @@ Three bugs only running it found:
   changed — and not in the markdown, so the self-check is unaffected.
 * **A borrow conflict** passing the whole cold state while holding a mutable borrow of
   its worker; fixed by passing only the fields read.
+
+### Kept kernels: no recomputation across restarts
+
+`qlive live` runs the kernel in a daemon that outlives it: `worker.py --serve`, the
+same JSON-lines protocol on a loopback socket, one client at a time, opened only with
+a 256-bit token kept in `%LOCALAPPDATA%\qlive\kernels`. It is started detached
+through an intermediate process, so killing qlive's process tree (as the VS Code
+extension does) leaves it running, and it exits after `QLIVE_KERNEL_IDLE_MINUTES`
+(default 120) without a client. One daemon serves one chain of documents with one
+Python and worker version.
+
+Variables alone would not help: the planner's bookkeeping (outputs by signature,
+which signature each name holds, cell analyses) lives in qlive. So the daemon keeps
+that too, as an opaque `stash`, and it lives exactly as long as the variables do. A
+pass clears the stash before it runs or forgets anything and stores it after, so a
+qlive killed mid-cell leaves no stash and the next start restarts the kernel rather
+than trust it. A kept kernel set up for other front matter (Quarto's kernel setup
+is hashed into the stash) is restarted too. Quarto's kernel setup itself is kept in
+the restart cache, so a restart with a kept kernel needs no `quarto inspect`.
+
+Measured on a document whose first cell sleeps 3 s, debug build, launch until the
+page is served:
+
+| start | served | cells run |
+|---|---:|---|
+| first | 8,841 ms | 2 |
+| restart, nothing changed | **643 ms** | **0** (kept kernel reused in 5 ms) |
+| restart after editing the second cell while stopped | **632 ms** | 1 |
+| restart after qlive was killed during the 3 s cell | 5,997 ms | 2, after restarting the kernel |
+
+`qlive kernels` lists them; `--start F` starts F's kernel and runs its cells without
+a preview, `--stop [F]` ends one or all (by process id when a preview holds it), and
+`--fresh` on `qlive live` replaces it. A busy daemon is never replaced by a second.
 
 ### Which cells run: a dependency graph (M6)
 

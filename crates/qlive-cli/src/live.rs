@@ -20,7 +20,7 @@
 //! and any difference turns the warm path off for that document.
 
 use crate::restart;
-use crate::session::{read_expanded, run_chain, start_session, Chain, Pass, Session};
+use crate::session::{read_expanded, run_chain, start_session, Chain, KernelMode, Pass, Session};
 use anyhow::{anyhow, Result};
 use notify::{RecursiveMode, Watcher};
 use qlive_core::cells::{self, Cell};
@@ -77,7 +77,7 @@ pub async fn run(doc: PathBuf, after: Vec<PathBuf>, port: u16, fresh: bool) -> R
     let cached = if fresh { None } else { cached_cold(&tools, chain.target(), mode)? };
     let restarted = cached.is_some();
     let (session, cold, pass) = if has_cells {
-        let mut session = start_session(&tools, chain.target())?;
+        let mut session = start_session(&tools, &chain, KernelMode::Persistent { fresh })?;
         let pass = run_chain(&mut session, &chain)?;
         report_pass("first run", &pass);
         let cold = match cached { Some(cold) => cold, None => cold_cells(&tools, chain.target(), &pass)? };

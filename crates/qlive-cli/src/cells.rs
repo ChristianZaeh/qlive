@@ -6,7 +6,7 @@
 //! Each pass writes a populated notebook and hands it to
 //! `quarto render --no-execute`, so Quarto renders our outputs and runs nothing.
 
-use crate::session::{run_chain, start_session, Chain};
+use crate::session::{run_chain, start_session, Chain, KernelMode};
 use anyhow::{anyhow, Result};
 use notify::{RecursiveMode, Watcher};
 use qlive_core::cells;
@@ -23,7 +23,7 @@ pub fn run(doc: PathBuf, once: bool, to: Option<String>) -> Result<()> {
     let chain = Chain {
         docs: vec![doc.clone()],
     };
-    let mut session = start_session(&tools, &doc)?;
+    let mut session = start_session(&tools, &chain, KernelMode::Private)?;
     let notebook = doc.with_extension("qlive.ipynb");
 
     loop {

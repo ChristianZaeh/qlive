@@ -18,11 +18,19 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::net::TcpStream;
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const WORKER_PY: &str = include_str!("worker.py");
+
+/// Identifies this build's worker protocol: a daemon running another one is not reused.
+pub fn worker_version() -> String {
+    // FNV-1a: stable across builds and platforms, unlike std's hasher.
+    let hash = WORKER_PY.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+    format!("{hash:016x}")
+}
 
 /// What the analysis found in one cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,9 +52,10 @@ pub struct CellResult {
 }
 
 pub struct Kernel {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// `None` for a daemon's kernel, which outlives this process.
+    child: Option<Child>,
+    writer: Box<dyn Write + Send>,
+    reader: Box<dyn BufRead + Send>,
     stderr: Receiver<String>,
     next_id: u64,
     /// Keys of the cells executed in this kernel, in order. The live state.
@@ -99,13 +108,105 @@ impl Kernel {
         }
 
         Ok(Self {
-            child,
-            stdin,
-            stdout,
+            child: Some(child),
+            writer: Box::new(stdin),
+            reader: Box::new(stdout),
             stderr,
             next_id: 0,
             executed: Vec::new(),
         })
+    }
+
+    /// The kernel of the daemon `state` describes, started if none answers. Returns
+    /// whether it already held a running kernel, whose variables survived the last
+    /// client. Fails, rather than waiting, while another client holds it.
+    pub fn persistent(python: &Path, cwd: &Path, state: &Path, label: &str, idle: Duration) -> Result<(Self, bool)> {
+        match Self::connect(state) {
+            Ok(mut kernel) => {
+                let started = kernel.call(json!({"op": "ping"}))?["started"].as_bool() == Some(true);
+                if !started { kernel.call(json!({"op": "start"})).context("booting the Jupyter kernel")?; }
+                return Ok((kernel, started));
+            }
+            // Accepting but not answering means serving someone else: never start a
+            // second daemon over it, which would orphan the first.
+            Err(_) if Self::listening(state) => return Err(anyhow!("the kept kernel is in use by another qlive")),
+            Err(_) => {}
+        }
+        let script = script_path()?;
+        std::fs::write(&script, WORKER_PY).with_context(|| format!("writing {}", script.display()))?;
+        if let Some(dir) = state.parent() { std::fs::create_dir_all(dir)?; }
+        let _ = std::fs::remove_file(state);
+        let status = Command::new(python)
+            .arg(&script).arg("--spawn-daemon").arg(state).arg(idle.as_secs().to_string()).arg(label)
+            .current_dir(cwd)
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .status()
+            .map_err(|e| anyhow!("could not start {}: {e}", python.display()))?;
+        if !status.success() { return Err(anyhow!("kernel daemon did not start: {status}")); }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut kernel = loop {
+            match Self::connect(state) {
+                Ok(kernel) => break kernel,
+                Err(e) if Instant::now() > deadline => return Err(e.context("kernel daemon did not come up")),
+                Err(_) => std::thread::sleep(Duration::from_millis(25)),
+            }
+        };
+        kernel.call(json!({"op": "start"})).context("booting the Jupyter kernel")?;
+        Ok((kernel, false))
+    }
+
+    /// Whether the daemon `state` names still accepts connections.
+    fn listening(state: &Path) -> bool {
+        let port = std::fs::read(state).ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|info| info["port"].as_u64());
+        port.is_some_and(|port| TcpStream::connect_timeout(&([127, 0, 0, 1], port as u16).into(), Duration::from_millis(300)).is_ok())
+    }
+
+    fn connect(state: &Path) -> Result<Self> {
+        let info: Value = serde_json::from_slice(&std::fs::read(state)?)?;
+        let port = info["port"].as_u64().ok_or_else(|| anyhow!("no port"))? as u16;
+        let token = info["token"].as_str().ok_or_else(|| anyhow!("no token"))?;
+        let stream = TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_secs(1))?;
+        stream.set_nodelay(true)?;
+        let mut writer = stream.try_clone()?;
+        // A daemon serving another client does not answer; give up rather than hang.
+        // Set on the handle that reads: Windows keeps socket options per handle.
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        let mut reader = BufReader::new(stream);
+        writeln!(writer, "{}", json!({"token": token}))?;
+        writer.flush()?;
+        let mut hello = String::new();
+        reader.read_line(&mut hello).context("kernel daemon busy or gone")?;
+        if serde_json::from_str::<Value>(&hello).ok().and_then(|v| v["ok"].as_bool()) != Some(true) {
+            return Err(anyhow!("kernel daemon refused the token"));
+        }
+        reader.get_ref().set_read_timeout(None)?;
+        let (_, stderr) = channel::<String>();
+        Ok(Self { child: None, writer: Box::new(writer), reader: Box::new(reader), stderr, next_id: 0, executed: Vec::new() })
+    }
+
+    /// Whether this kernel lives in a daemon rather than in a child of this process.
+    pub fn is_daemon(&self) -> bool {
+        self.child.is_none()
+    }
+
+    /// Stop the daemon `state` describes, if one answers.
+    pub fn stop_daemon(state: &Path) -> Result<()> {
+        let mut kernel = Self::connect(state)?;
+        kernel.call(json!({"op": "shutdown"}))?;
+        Ok(())
+    }
+
+    /// Keep `state` in the worker: it lives exactly as long as the kernel's variables.
+    pub fn stash(&mut self, state: &Value) -> Result<()> {
+        self.call(json!({"op": "stash", "state": state}))?;
+        Ok(())
+    }
+
+    /// What the last client stashed; `Null` when nothing was, or a pass never finished.
+    pub fn unstash(&mut self) -> Result<Value> {
+        Ok(self.call(json!({"op": "unstash"}))?["state"].take())
     }
 
     /// Which names each cell defines and reads, from Python's `ast` in the worker. The
@@ -210,14 +311,14 @@ impl Kernel {
 
         let started = Instant::now();
         let line = serde_json::to_string(&request)?;
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
+        self.writer.write_all(line.as_bytes())?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()?;
 
         let mut buffer = String::new();
         loop {
             buffer.clear();
-            let read = self.stdout.read_line(&mut buffer)?;
+            let read = self.reader.read_line(&mut buffer)?;
             if read == 0 {
                 return Err(anyhow!(
                     "kernel worker exited after {:?}{}",
@@ -263,10 +364,12 @@ impl Kernel {
 
 impl Drop for Kernel {
     fn drop(&mut self) {
+        // A daemon's kernel is meant to outlive us: just disconnect.
+        let Some(mut child) = self.child.take() else { return };
         // Best effort: ask nicely, then make sure.
         let _ = self.call(json!({"op": "shutdown"}));
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 

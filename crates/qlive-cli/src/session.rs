@@ -10,12 +10,13 @@
 use anyhow::{anyhow, Result};
 use qlive_core::cells::{self, Cell, CellOutputs};
 use qlive_core::deps::{self, CellInfo, Holder, Step};
-use qlive_core::Toolchain;
+use qlive_core::{frontmatter, Toolchain};
 use qlive_kernel::Kernel;
 use qlive_quarto::engine;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use serde_json::Value;
+use std::time::{Duration, Instant};
 
 /// Documents whose cells share one kernel, in execution order. The last one is the
 /// document being previewed. With a master file this is just the master: its
@@ -39,6 +40,104 @@ pub struct Session {
     holder: Holder,
     /// Analysis by source hash, so unchanged cells are not re-parsed.
     analysis: HashMap<String, CellInfo>,
+    /// Hash of Quarto's kernel setup: a kept kernel set up differently is restarted.
+    setup: String,
+    /// The kernel lives in a daemon, which keeps this bookkeeping alongside it.
+    persistent: bool,
+}
+
+/// Where the kernel runs.
+#[derive(Clone, Copy)]
+pub enum KernelMode {
+    /// Owned by this process, gone when it exits.
+    Private,
+    /// In a daemon that outlives qlive, so the next start finds its variables.
+    /// `fresh` replaces a running one.
+    Persistent { fresh: bool },
+}
+
+/// Minutes without a client before a kernel daemon exits: `QLIVE_KERNEL_IDLE_MINUTES`.
+fn idle() -> Duration {
+    let minutes = std::env::var("QLIVE_KERNEL_IDLE_MINUTES").ok().and_then(|m| m.parse().ok()).unwrap_or(120u64);
+    Duration::from_secs(minutes * 60)
+}
+
+/// Daemon state files live here; `qlive kernels` lists them.
+pub fn kernels_dir() -> Option<PathBuf> {
+    Some(crate::restart::base()?.join("kernels"))
+}
+
+/// One daemon per Python, worker protocol and chain of documents.
+fn daemon_state(python: &Path, chain: &Chain) -> Result<PathBuf> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(python.to_string_lossy().as_bytes());
+    hasher.update(qlive_kernel::worker_version().as_bytes());
+    for doc in &chain.docs {
+        hasher.update(b"\0");
+        hasher.update(doc.to_string_lossy().as_bytes());
+    }
+    let dir = kernels_dir().ok_or_else(|| anyhow!("no cache directory"))?;
+    Ok(dir.join(format!("{}.json", &hasher.finalize().to_hex()[..24])))
+}
+
+/// Quarto's kernel setup depends on the same inputs as the restart cache, so it is
+/// kept there: a restart that finds its kernel running needs no `quarto inspect`.
+fn kernel_setup(tools: &Toolchain, target: &Path) -> Result<qlive_quarto::inspect::KernelSetup> {
+    let expanded = read_expanded(target)?;
+    let front = frontmatter::split(&expanded.text).0;
+    let mut metadata = Vec::new();
+    for file in &expanded.files {
+        if let Some(f) = frontmatter::split(&std::fs::read_to_string(file)?).0 { metadata.push((file.clone(), f.to_owned())); }
+    }
+    let key = crate::restart::key(tools, target, "kernel-setup", front, &metadata)?;
+    if let Some(value) = crate::restart::load_value(&key) {
+        if let (Some(script), false, false) = (value["script"].as_str(), value["args"].is_null(), value["env"].is_null()) {
+            if Path::new(script).is_file() {
+                return Ok(qlive_quarto::inspect::KernelSetup { script: script.into(), args: value["args"].clone(), env: value["env"].clone() });
+            }
+        }
+    }
+    let setup = qlive_quarto::inspect::kernel_setup(&tools.quarto, target, "html")?;
+    let value = serde_json::json!({"script": setup.script, "args": setup.args, "env": setup.env});
+    if let Err(e) = crate::restart::store_value(&key, &value) { println!("qlive: kernel setup not cached: {e}"); }
+    Ok(setup)
+}
+
+fn setup_hash(setup: &qlive_quarto::inspect::KernelSetup) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(serde_json::json!({"script": setup.script, "args": setup.args, "env": setup.env}).to_string().as_bytes());
+    hasher.update(&std::fs::read(&setup.script).unwrap_or_default());
+    hasher.finalize().to_hex()[..24].to_owned()
+}
+
+impl Session {
+    fn state(&self) -> Value {
+        serde_json::json!({"setup": self.setup, "cache": self.cache, "holder": self.holder, "analysis": self.analysis})
+    }
+
+    /// Adopt what the daemon kept. `false` when it is missing, from another setup, or
+    /// was invalidated by a pass that never finished.
+    fn restore(&mut self, state: &Value) -> bool {
+        if state["setup"].as_str() != Some(self.setup.as_str()) { return false; }
+        let parts = (
+            serde_json::from_value(state["cache"].clone()),
+            serde_json::from_value(state["holder"].clone()),
+            serde_json::from_value(state["analysis"].clone()),
+        );
+        let (Ok(cache), Ok(holder), Ok(analysis)) = parts else { return false };
+        (self.cache, self.holder, self.analysis) = (cache, holder, analysis);
+        true
+    }
+
+    /// Whether the kernel outlives this process (a daemon could not be reached otherwise).
+    pub fn is_persistent(&self) -> bool {
+        self.persistent
+    }
+
+    fn save(&mut self) -> Result<()> {
+        if self.persistent { let state = self.state(); self.kernel.stash(&state)?; }
+        Ok(())
+    }
 }
 
 /// One pass over the chain.
@@ -56,8 +155,11 @@ pub struct Pass {
     pub ran: Vec<String>,
 }
 
-/// Boot the kernel with Quarto's own setup, so figures match Quarto's.
-pub fn start_session(tools: &Toolchain, target: &Path) -> Result<Session> {
+/// Boot the kernel with Quarto's own setup, so figures match Quarto's. A persistent
+/// kernel still running from an earlier start is reused with its variables and
+/// bookkeeping, so no cell runs again unless it changed.
+pub fn start_session(tools: &Toolchain, chain: &Chain, mode: KernelMode) -> Result<Session> {
+    let target = chain.target();
     let python = tools.python.clone().ok_or_else(|| {
         anyhow!("no usable Python 3 found (the Microsoft Store stub does not count); set QLIVE_PYTHON")
     })?;
@@ -69,23 +171,49 @@ pub fn start_session(tools: &Toolchain, target: &Path) -> Result<Session> {
     // Booting ipykernel and asking Quarto for its setup are independent and each
     // takes about a second or more; overlap them.
     let (kernel, setup) = std::thread::scope(|scope| {
-        let setup = scope.spawn(|| qlive_quarto::inspect::kernel_setup(&tools.quarto, target, "html"));
-        let kernel = Kernel::start(&python, dir);
+        let setup = scope.spawn(|| kernel_setup(tools, target));
+        let kernel = match mode {
+            KernelMode::Private => Kernel::start(&python, dir).map(|k| (k, false)),
+            KernelMode::Persistent { fresh } => daemon_state(&python, chain).and_then(|state| {
+                if fresh { let _ = Kernel::stop_daemon(&state); }
+                Kernel::persistent(&python, dir, &state, &target.display().to_string(), idle())
+            }).or_else(|e| {
+                println!("qlive: kernel daemon unavailable ({e:#}); using a kernel that ends with qlive");
+                Kernel::start(&python, dir).map(|k| (k, false))
+            }),
+        };
         (kernel, setup.join().unwrap_or_else(|_| Err(anyhow!("quarto inspect panicked"))))
     });
-    let (mut kernel, setup) = (kernel?, setup?);
-    kernel.setup(&setup.script, &setup.args, &setup.env)?;
-    println!(
-        "qlive: kernel ready with Quarto's setup in {:.0} ms (paid once)",
-        started.elapsed().as_secs_f64() * 1000.0
-    );
-
-    Ok(Session {
+    let ((kernel, reused), setup) = (kernel?, setup?);
+    let persistent = matches!(mode, KernelMode::Persistent { .. }) && kernel.is_daemon();
+    let mut session = Session {
         kernel,
         cache: HashMap::new(),
         holder: Holder::new(),
         analysis: HashMap::new(),
-    })
+        setup: setup_hash(&setup),
+        persistent,
+    };
+    if reused {
+        let state = session.kernel.unstash()?;
+        if session.restore(&state) {
+            println!(
+                "qlive: kept kernel reused in {:.0} ms: {} outputs, {} variables still defined",
+                started.elapsed().as_secs_f64() * 1000.0, session.cache.len(), session.holder.len()
+            );
+            return Ok(session);
+        }
+        println!("qlive: kept kernel had another setup or an unfinished pass; restarting it");
+        session.kernel.restart()?;
+    }
+    session.kernel.setup(&setup.script, &setup.args, &setup.env)?;
+    session.save()?;
+    println!(
+        "qlive: kernel ready with Quarto's setup in {:.0} ms{}",
+        started.elapsed().as_secs_f64() * 1000.0,
+        if session.persistent { " (kept running after qlive exits)" } else { " (paid once)" }
+    );
+    Ok(session)
 }
 
 /// Run exactly the cells the dependency planner says, and collect the target's
@@ -112,6 +240,10 @@ pub fn run_chain(session: &mut Session, chain: &Chain) -> Result<Pass> {
 
     let (mut executed, mut kernel_ms) = (0usize, 0.0f64);
     let mut ran = Vec::new();
+    // From here the kernel's variables may move ahead of the bookkeeping. Drop the
+    // kept copy until the pass completes, so a qlive killed mid-pass leaves a kernel
+    // the next start restarts instead of trusts.
+    if session.persistent && !plan.steps.is_empty() { session.kernel.stash(&Value::Null)?; }
     for step in &plan.steps {
         match step {
             Step::Forget(names) => {
@@ -159,6 +291,8 @@ pub fn run_chain(session: &mut Session, chain: &Chain) -> Result<Pass> {
             }
         }
     }
+
+    session.save()?;
 
     let target = docs.len() - 1;
     let mut outputs = vec![None; docs[target].len()];

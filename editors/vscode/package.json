@@ -2,7 +2,7 @@
   "name": "qlive-preview",
   "displayName": "qlive Preview",
   "description": "Quarto preview from unsaved editor buffers",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "publisher": "qlive-local",
   "engines": {
     "vscode": "^1.85.0"
@@ -89,6 +89,17 @@
         "title": "Comment on Preview",
         "category": "qlive",
         "icon": "$(comment-add)"
+      },
+      {
+        "command": "qlive.toggleKernel",
+        "title": "Start/Stop Python Kernel",
+        "category": "qlive",
+        "icon": "$(server-process)"
+      },
+      {
+        "command": "qlive.stopAllKernels",
+        "title": "Stop All Kept Python Kernels",
+        "category": "qlive"
       }
     ],
     "views": {

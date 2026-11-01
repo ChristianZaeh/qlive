@@ -11,6 +11,9 @@ so the process that owns the kernel has to outlive the render.
   -> {"id":3,"op":"shutdown"}
 
 Outputs are already nbformat-shaped, so they can be written straight into a notebook.
+
+With `--serve STATE IDLE LABEL` the same protocol runs on a loopback socket behind a
+token, so the kernel outlives the qlive that started it; see `serve`.
 """
 
 import ast
@@ -327,112 +330,245 @@ def collect(kc, msg_id, timeout=600):
     return outputs, execution_count
 
 
+def run_quietly(kc, code):
+    msg_id = kc.execute(code, store_history=False, allow_stdin=False)
+    kc.get_shell_msg(timeout=600)
+    return collect(kc, msg_id)
+
+
+def handle(req, st):
+    """One request against the worker state `st`; returns (reply, stop)."""
+    rid, op = req.get("id"), req.get("op")
+    km, kc = st.get("km"), st.get("kc")
+    if op == "start":
+        started = time.perf_counter()
+        st["km"], st["kc"] = start_new_kernel(kernel_name=req.get("kernel", "python3"))
+        return {"id": rid, "ok": True, "ms": (time.perf_counter() - started) * 1000}, False
+    if op == "ping":
+        return {"id": rid, "ok": True, "started": kc is not None}, False
+    if op == "stash":
+        # The client's bookkeeping about this kernel's variables. Kept here so it lives
+        # exactly as long as the variables do.
+        st["stash"] = req.get("state")
+        return {"id": rid, "ok": True}, False
+    if op == "unstash":
+        return {"id": rid, "ok": True, "state": st.get("stash")}, False
+    if op == "execute":
+        if kc is None:
+            raise RuntimeError("kernel not started")
+        started = time.perf_counter()
+        # allow_stdin=False, as nbclient (and so Quarto) executes: a cell that
+        # asks for input must fail, not hang the preview waiting for a keypress.
+        msg_id = kc.execute(req["code"], allow_stdin=False)
+        kc.get_shell_msg(timeout=600)
+        outputs, count = collect(kc, msg_id)
+        return {
+            "id": rid,
+            "ok": True,
+            "outputs": outputs,
+            "execution_count": count,
+            "ms": (time.perf_counter() - started) * 1000,
+        }, False
+    if op == "setup":
+        # Quarto's own kernel setup: share/jupyter/lang/python/setup.py, filled
+        # with str.format exactly as notebook.py's nb_language_cell does, and
+        # run with store_history=False so document cells still count from 1.
+        if kc is None:
+            raise RuntimeError("kernel not started")
+        import base64
+
+        args = dict(req.get("args", {}))
+        args["run_path"] = base64.b64encode(
+            args.get("run_path", "").encode("utf-8")
+        ).decode("utf-8")
+        with open(req["path"], "r", encoding="utf-8") as f:
+            source = f.read().format(**args)
+
+        started = time.perf_counter()
+        failures = []
+        env = req.get("env") or {}
+        for code in (
+            # set_env_vars sets these before the kernel starts; same effect here.
+            "import os\nos.environ.update(" + json.dumps(env) + ")\n" if env else "",
+            source,
+        ):
+            if not code:
+                continue
+            # setup.py runs `%reset`, which asks "Proceed (y/[n])?" on stdin and
+            # waits forever unless stdin is disallowed; IPython then treats the
+            # missing stdin as yes. That reset is also why Quarto gives every
+            # document a fresh kernel — so setup runs once per session here,
+            # before the first document, never between documents.
+            outputs, _ = run_quietly(kc, code)
+            failures += [o for o in outputs if o["output_type"] == "error"]
+        if failures:
+            raise RuntimeError(
+                f"setup failed: {failures[0]['ename']}: {failures[0]['evalue']}"
+            )
+        return {"id": rid, "ok": True, "ms": (time.perf_counter() - started) * 1000}, False
+    if op == "analyze":
+        # Parsed here, in the worker, never executed in the kernel.
+        return {"id": rid, "ok": True, "cells": [analyze(c) for c in req["codes"]]}, False
+    if op == "forget":
+        # Delete names whose only definer is gone, so their readers fail the
+        # way they would in a fresh run instead of seeing a stale value.
+        if kc is None:
+            raise RuntimeError("kernel not started")
+        run_quietly(kc, "for _qlive_n in " + json.dumps(req["names"]) + ":\n"
+                        "    globals().pop(_qlive_n, None)\ndel _qlive_n\n")
+        return {"id": rid, "ok": True}, False
+    if op == "restart":
+        if km is None:
+            raise RuntimeError("kernel not started")
+        km.restart_kernel(now=True)
+        st["kc"] = km.client()
+        st["kc"].start_channels()
+        st["kc"].wait_for_ready(timeout=120)
+        st["stash"] = None
+        return {"id": rid, "ok": True}, False
+    if op == "shutdown":
+        if km is not None:
+            km.shutdown_kernel(now=True)
+            st["km"] = st["kc"] = None
+        return {"id": rid, "ok": True}, True
+    raise RuntimeError(f"unknown op: {op}")
+
+
+def handle_line(line, st):
+    line = line.strip()
+    if not line:
+        return None, False
+    try:
+        req = json.loads(line)
+    except Exception as e:
+        return {"ok": False, "err": f"bad json: {e}"}, False
+    try:
+        return handle(req, st)
+    except Exception as e:
+        return {"id": req.get("id"), "ok": False, "err": f"{type(e).__name__}: {e}"}, False
+
+
 def main():
-    km = kc = None
+    st = {}
     for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
+        resp, stop = handle_line(line, st)
+        if resp is not None:
+            print(json.dumps(resp), flush=True)
+        if stop:
+            return
+
+
+def serve_client(conn, st, token):
+    """Authenticate one connection and answer it until it closes; True to shut down."""
+    import hmac
+
+    rf = conn.makefile("r", encoding="utf-8")
+    wf = conn.makefile("w", encoding="utf-8")
+    try:
         try:
-            req = json.loads(line)
-        except Exception as e:
-            print(json.dumps({"ok": False, "err": f"bad json: {e}"}), flush=True)
-            continue
+            hello = json.loads(rf.readline() or "{}")
+            ok = hmac.compare_digest(str(hello.get("token", "")).encode(), token.encode())
+        except ValueError:
+            ok = False
+        if not ok:
+            return False
+        wf.write(json.dumps({"ok": True}) + "\n")
+        wf.flush()
+        for line in rf:
+            resp, stop = handle_line(line, st)
+            if resp is not None:
+                wf.write(json.dumps(resp) + "\n")
+                wf.flush()
+            if stop:
+                return True
+        return False
+    finally:
+        for f in (wf, rf):
+            try:
+                f.close()
+            except (OSError, ValueError):
+                pass
 
-        rid, op = req.get("id"), req.get("op")
+
+def serve(state_file, idle_seconds, label):
+    """Daemon mode: the same protocol on a loopback socket, one client at a time, so
+    the kernel and its variables survive the qlive process that started them.
+
+    Anyone who can connect could run code, so the first line must carry the 256-bit
+    token written to `state_file`, which lives in the user's own cache directory.
+    Exits, shutting the kernel down, after `idle_seconds` without a client.
+    """
+    import os
+    import secrets
+    import socket
+
+    token = secrets.token_hex(32)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    server.settimeout(idle_seconds)
+    temporary = state_file + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as f:
+        json.dump({"port": server.getsockname()[1], "token": token, "pid": os.getpid(),
+                   "label": label, "started": time.time()}, f)
+    os.replace(temporary, state_file)
+
+    st = {}
+    try:
+        while True:
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                break
+            conn.settimeout(None)
+            # A client that vanishes mid-cell must not take the kernel with it: every
+            # socket error, including the flush when the files close, ends only
+            # this connection.
+            try:
+                stop = serve_client(conn, st, token)
+            except (OSError, ValueError):
+                stop = False
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+            if stop:
+                break
+    finally:
+        if st.get("km") is not None:
+            st["km"].shutdown_kernel(now=True)
         try:
-            if op == "start":
-                started = time.perf_counter()
-                km, kc = start_new_kernel(kernel_name=req.get("kernel", "python3"))
-                resp = {"id": rid, "ok": True, "ms": (time.perf_counter() - started) * 1000}
-            elif op == "execute":
-                if kc is None:
-                    raise RuntimeError("kernel not started")
-                started = time.perf_counter()
-                # allow_stdin=False, as nbclient (and so Quarto) executes: a cell that
-                # asks for input must fail, not hang the preview waiting for a keypress.
-                msg_id = kc.execute(req["code"], allow_stdin=False)
-                kc.get_shell_msg(timeout=600)
-                outputs, count = collect(kc, msg_id)
-                resp = {
-                    "id": rid,
-                    "ok": True,
-                    "outputs": outputs,
-                    "execution_count": count,
-                    "ms": (time.perf_counter() - started) * 1000,
-                }
-            elif op == "setup":
-                # Quarto's own kernel setup: share/jupyter/lang/python/setup.py, filled
-                # with str.format exactly as notebook.py's nb_language_cell does, and
-                # run with store_history=False so document cells still count from 1.
-                if kc is None:
-                    raise RuntimeError("kernel not started")
-                import base64
+            with open(state_file, encoding="utf-8") as f:
+                if json.load(f).get("pid") == os.getpid():
+                    os.remove(state_file)
+        except Exception:
+            pass
 
-                args = dict(req.get("args", {}))
-                args["run_path"] = base64.b64encode(
-                    args.get("run_path", "").encode("utf-8")
-                ).decode("utf-8")
-                with open(req["path"], "r", encoding="utf-8") as f:
-                    source = f.read().format(**args)
 
-                started = time.perf_counter()
-                failures = []
-                env = req.get("env") or {}
-                for code in (
-                    # set_env_vars sets these before the kernel starts; same effect here.
-                    "import os\nos.environ.update(" + json.dumps(env) + ")\n" if env else "",
-                    source,
-                ):
-                    if not code:
-                        continue
-                    # setup.py runs `%reset`, which asks "Proceed (y/[n])?" on stdin and
-                    # waits forever unless stdin is disallowed; IPython then treats the
-                    # missing stdin as yes. That reset is also why Quarto gives every
-                    # document a fresh kernel — so setup runs once per session here,
-                    # before the first document, never between documents.
-                    msg_id = kc.execute(code, store_history=False, allow_stdin=False)
-                    kc.get_shell_msg(timeout=600)
-                    outputs, _ = collect(kc, msg_id)
-                    failures += [o for o in outputs if o["output_type"] == "error"]
-                if failures:
-                    raise RuntimeError(
-                        f"setup failed: {failures[0]['ename']}: {failures[0]['evalue']}"
-                    )
-                resp = {"id": rid, "ok": True, "ms": (time.perf_counter() - started) * 1000}
-            elif op == "analyze":
-                # Parsed here, in the worker, never executed in the kernel.
-                resp = {"id": rid, "ok": True, "cells": [analyze(c) for c in req["codes"]]}
-            elif op == "forget":
-                # Delete names whose only definer is gone, so their readers fail the
-                # way they would in a fresh run instead of seeing a stale value.
-                if kc is None:
-                    raise RuntimeError("kernel not started")
-                code = "for _qlive_n in " + json.dumps(req["names"]) + ":\n" \
-                       "    globals().pop(_qlive_n, None)\ndel _qlive_n\n"
-                msg_id = kc.execute(code, store_history=False, allow_stdin=False)
-                kc.get_shell_msg(timeout=600)
-                collect(kc, msg_id)
-                resp = {"id": rid, "ok": True}
-            elif op == "restart":
-                if km is None:
-                    raise RuntimeError("kernel not started")
-                km.restart_kernel(now=True)
-                kc = km.client()
-                kc.start_channels()
-                kc.wait_for_ready(timeout=120)
-                resp = {"id": rid, "ok": True}
-            elif op == "shutdown":
-                if km is not None:
-                    km.shutdown_kernel(now=True)
-                print(json.dumps({"id": rid, "ok": True}), flush=True)
-                return
-            else:
-                raise RuntimeError(f"unknown op: {op}")
-        except Exception as e:
-            resp = {"id": rid, "ok": False, "err": f"{type(e).__name__}: {e}"}
-        print(json.dumps(resp), flush=True)
+def spawn_daemon(state_file, idle_seconds, label):
+    """Start `serve` detached and return at once. The daemon's parent is gone by the
+    time anyone kills qlive's process tree, so it survives that too."""
+    import subprocess
+
+    args = [sys.executable, __file__, "--serve", state_file, str(idle_seconds), label]
+    common = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+              "stderr": subprocess.DEVNULL, "close_fds": True}
+    if sys.platform == "win32":
+        detached, group, breakaway = 0x00000008, 0x00000200, 0x01000000
+        try:
+            subprocess.Popen(args, creationflags=detached | group | breakaway, **common)
+        except OSError:
+            # Some job objects forbid breakaway; detached still survives a tree kill.
+            subprocess.Popen(args, creationflags=detached | group, **common)
+    else:
+        subprocess.Popen(args, start_new_session=True, **common)
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) >= 5 and sys.argv[1] == "--serve":
+        serve(sys.argv[2], float(sys.argv[3]), sys.argv[4])
+    elif len(sys.argv) >= 5 and sys.argv[1] == "--spawn-daemon":
+        spawn_daemon(sys.argv[2], float(sys.argv[3]), sys.argv[4])
+    else:
+        main()

@@ -32,7 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 /// What the analysis knows about one code cell.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CellInfo {
     /// Hash of the cell's own source.
     pub hash: String,

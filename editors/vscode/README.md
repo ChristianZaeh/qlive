@@ -31,8 +31,16 @@ Failed cells display errors; their dependent cells are blocked, and unrelated ce
 continue. Dependencies use Python name analysis with qlive's documented limits;
 an unparseable cell conservatively blocks later cells.
 
+**Kept Python kernel.** The kernel outlives the preview, so reopening it runs no cell
+that has not changed. For a `.qmd` with Python cells the status bar shows
+**▶ Kernel** (not running) or **⏹ Kernel** (running, variables kept). Clicking it
+starts the kernel and runs the saved cells without opening a preview, or stops it to
+free memory and GPU memory; stopping also closes a preview that uses it. **qlive:
+Stop All Kept Python Kernels** ends every one. Kernels exit by themselves after two
+hours without a preview (`QLIVE_KERNEL_IDLE_MINUTES`).
+
 Build and install the local VSIX with `python editors/vscode/package.py`, then
-`code --install-extension editors/vscode/qlive-preview-0.5.1.vsix --force`.
+`code --install-extension editors/vscode/qlive-preview-0.6.0.vsix --force`.
 
 To route the installed Quarto extension's existing Preview menus and shortcut into
 qlive, run `python editors/vscode/integrate_quarto.py <installed-quarto-extension-dir>`

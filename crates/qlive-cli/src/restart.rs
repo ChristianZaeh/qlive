@@ -23,12 +23,35 @@ pub struct Entry {
     pub page_file: PathBuf,
 }
 
-fn root() -> Option<PathBuf> {
+/// qlive's directory in the user's cache: `%LOCALAPPDATA%\qlive` and the like.
+pub fn base() -> Option<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("qlive").join("restart"))
+    Some(base.join("qlive"))
+}
+
+fn root() -> Option<PathBuf> {
+    Some(base()?.join("restart"))
+}
+
+/// A single JSON value under `key`, for results as cacheable as the capture.
+pub fn load_value(key: &str) -> Option<Value> {
+    let path = root()?.join(key).join("entry.json");
+    let value: Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+    let _ = filetime_touch(&path);
+    Some(value["value"].clone())
+}
+
+pub fn store_value(key: &str, value: &Value) -> Result<()> {
+    let root = root().ok_or_else(|| anyhow!("no cache directory"))?;
+    prune(&root);
+    std::fs::create_dir_all(root.join(key))?;
+    let temporary = root.join(key).join(format!("entry.json.tmp-{}", std::process::id()));
+    std::fs::write(&temporary, serde_json::to_vec(&json!({"value": value}))?)?;
+    std::fs::rename(&temporary, root.join(key).join("entry.json"))?;
+    Ok(())
 }
 
 /// Everything a cold render's result depends on except the body.
