@@ -80,7 +80,10 @@ impl Preview {
         &self.entry
     }
 
-    pub fn set_sources(&self, sources: Vec<serde_json::Value>, manifest: serde_json::Value) {
+    pub fn set_sources(&self, sources: Vec<serde_json::Value>, manifest: serde_json::Value, revision: Option<u64>) {
+        if let Some(files) = manifest["files"].as_array() {
+            if !self.set_editor_files(&files.iter().filter_map(|path| path.as_str().map(PathBuf::from)).collect::<Vec<_>>(), revision) { return; }
+        }
         if let Ok(mut current) = self.sources.write() { *current = sources; }
         if self.editor.is_some() {
             if let Ok(mut current) = self.source_manifest.write() {

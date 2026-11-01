@@ -44,6 +44,7 @@ struct Cold {
     /// What `/` serves on disk: the `.html` Quarto wrote.
     page_file: PathBuf,
     front_matter: Option<String>,
+    source_metadata: Vec<(PathBuf, String)>,
     /// `None` when the self-check says the warm path would not match Quarto.
     warm: Option<LuaWorker>,
 }
@@ -107,7 +108,7 @@ pub async fn run(doc: PathBuf, after: Vec<PathBuf>, port: u16) -> Result<()> {
         incremental: None,
     };
     let expanded = read_expanded(live.chain.target())?;
-    let body = map_sources(&shell::main_content(&live.cold.page).unwrap(), &expanded, &preview, false);
+    let body = map_sources(&shell::main_content(&live.cold.page).unwrap(), &expanded, &preview, false, None);
     let body = prepare_incremental(&mut live.incremental, &expanded.text, &body, &live.cold.capture.env);
     preview.set_page(live.cold.shell.page(&body));
     {
@@ -147,7 +148,8 @@ fn cold_plain(tools: &Toolchain, doc: &Path) -> Result<Cold> {
     let postprocess = qlive_quarto::postprocess::Options::from_capture(&capture.metadata, &capture.env)?.with_cold_page(&page);
     let shell = Shell::from_page(&page)?;
 
-    let source = read_expanded(doc)?.text;
+    let expanded = read_expanded(doc)?;
+    let source = &expanded.text;
     let (front, body) = frontmatter::split(&source);
 
     let warm = if frontmatter::same_body(body, &capture.input) {
@@ -170,6 +172,7 @@ fn cold_plain(tools: &Toolchain, doc: &Path) -> Result<Cold> {
         page,
         page_file,
         front_matter: front.map(str::to_string),
+        source_metadata: source_metadata(&expanded)?,
         warm,
     })
 }
@@ -214,7 +217,8 @@ fn cold_cells(tools: &Toolchain, doc: &Path, pass: &Pass) -> Result<Cold> {
     };
     report_cold(started, warm.is_some());
 
-    let source = read_expanded(doc)?.text;
+    let expanded = read_expanded(doc)?;
+    let source = &expanded.text;
     let (front, _) = frontmatter::split(&source);
     Ok(Cold {
         postprocess,
@@ -223,6 +227,7 @@ fn cold_cells(tools: &Toolchain, doc: &Path, pass: &Pass) -> Result<Cold> {
         page,
         page_file,
         front_matter: front.map(str::to_string),
+        source_metadata: source_metadata(&expanded)?,
         warm,
     })
 }
@@ -230,12 +235,13 @@ fn cold_cells(tools: &Toolchain, doc: &Path, pass: &Pass) -> Result<Cold> {
 // ---------------------------------------------------------------------------------
 // saves
 
-fn on_save(live: &mut Live, preview: &Preview) -> Result<()> {
+fn on_save(live: &mut Live, preview: &Preview, publish: bool, revision: Option<u64>) -> Result<()> {
     let started = Instant::now();
     let expanded = read_expanded(live.chain.target())?;
     let source = &expanded.text;
     let (front, body) = frontmatter::split(&source);
-    let front_changed = front.map(str::to_string) != live.cold.front_matter;
+    let front_changed = front.map(str::to_string) != live.cold.front_matter
+        || source_metadata(&expanded)? != live.cold.source_metadata;
 
     match live.session.as_mut() {
         Some(session) => {
@@ -265,9 +271,11 @@ fn on_save(live: &mut Live, preview: &Preview) -> Result<()> {
                         &expanded,
                         &mut live.incremental,
                         &live.cold.capture.env,
+                        publish, revision,
                     )? {
+                        let outcome = if can_publish(preview, publish, revision) { "pushed, no reload" } else { "saved inputs refreshed; editor buffers pending" };
                         println!(
-                            "qlive: warm {:>5.0} ms | cells: {} run, {} reused, kernel {:.0} ms | pushed, no reload",
+                            "qlive: warm {:>5.0} ms | cells: {} run, {} reused, kernel {:.0} ms | {outcome}",
                             ms(started),
                             pass.executed,
                             pass.reused,
@@ -303,8 +311,10 @@ fn on_save(live: &mut Live, preview: &Preview) -> Result<()> {
                         &expanded,
                         &mut live.incremental,
                         &live.cold.capture.env,
+                        publish, revision,
                     )? {
-                        println!("qlive: warm {:>5.0} ms | pushed, no reload", ms(started));
+                        let outcome = if can_publish(preview, publish, revision) { "pushed, no reload" } else { "saved inputs refreshed; editor buffers pending" };
+                        println!("qlive: warm {:>5.0} ms | {outcome}", ms(started));
                         return Ok(());
                     }
                 }
@@ -313,12 +323,16 @@ fn on_save(live: &mut Live, preview: &Preview) -> Result<()> {
         }
     }
 
-    let body = map_sources(&shell::main_content(&live.cold.page).unwrap(), &expanded, preview, false);
-    let body = prepare_incremental(&mut live.incremental, &expanded.text, &body, &live.cold.capture.env);
-    preview.set_page(live.cold.shell.page(&body));
-    preview.notify_reload();
+    live.incremental = None;
+    if can_publish(preview, publish, revision) {
+        let body = map_sources(&shell::main_content(&live.cold.page).unwrap(), &expanded, preview, false, revision);
+        let body = prepare_incremental(&mut live.incremental, &expanded.text, &body, &live.cold.capture.env);
+        preview.set_page(live.cold.shell.page(&body));
+        preview.notify_reload();
+    }
     let why = if front_changed { "front matter changed" } else { "warm path unavailable" };
-    println!("qlive: cold {:>5.0} ms ({why}), page reloaded", ms(started));
+    let outcome = if can_publish(preview, publish, revision) { "page reloaded" } else { "saved state refreshed; editor buffers pending" };
+    println!("qlive: cold {:>5.0} ms ({why}), {outcome}", ms(started));
     Ok(())
 }
 
@@ -337,7 +351,10 @@ fn push_warm(
     expanded: &qlive_core::includes::Expanded,
     incremental: &mut Option<qlive_quarto::incremental::Document>,
     env: &[(String, String)],
+    publish: bool,
+    revision: Option<u64>,
 ) -> Result<bool> {
+    if !can_publish(preview, publish, revision) { return Ok(true); }
     let rendered = worker.render_quarto(text, metadata)?;
     if rendered.has_fatal() {
         println!(
@@ -350,7 +367,8 @@ fn push_warm(
     // content, so a re-run figure is refetched instead of shown from cache.
     let processed = qlive_quarto::postprocess::process(&rendered.out, options);
     let html = shell::version_images(&processed, root);
-    let html = map_sources(&html, expanded, preview, false);
+    if !can_publish(preview, publish, revision) { return Ok(true); }
+    let html = map_sources(&html, expanded, preview, false, revision);
     let html = prepare_incremental(incremental, &expanded.text, &html, env);
     preview.set_page(shell.page(&html));
     preview.send_body(&html);
@@ -379,7 +397,7 @@ fn watch(mut live: Live, preview: &Preview, buffers: Option<std::sync::mpsc::Rec
                 }
             }
             if let Some(update) = latest {
-                let result = on_buffer(&mut live, preview, &update.text, update.revision)
+                let result = on_buffer(&mut live, preview, &update.snapshot)
                     .map_err(|e| e.to_string());
                 let _ = update.reply.send(result);
             }
@@ -400,8 +418,24 @@ fn watch(mut live: Live, preview: &Preview, buffers: Option<std::sync::mpsc::Rec
         std::thread::sleep(DEBOUNCE);
         while rx.try_recv().is_ok() {}
 
-        if let Err(e) = on_save(&mut live, preview) {
+        let before = preview.buffer_snapshot();
+        let publish = before.as_ref().is_none_or(|snapshot| snapshot.buffers.is_empty());
+        if let Err(e) = on_save(&mut live, preview, publish, before.as_ref().map(|s| s.revision)) {
             eprintln!("qlive: {e}");
+        } else if let Some(snapshot) = preview.buffer_snapshot() {
+            let already_published = publish && before.as_ref().is_some_and(|saved| saved.revision == snapshot.revision);
+            let result = if snapshot.buffers.is_empty() && already_published { Ok("updated saved document".into()) } else {
+                // The visible page still contains overlays, so never patch it using
+                // the saved document's block indices or cell output snapshot.
+                live.incremental = None;
+                on_buffer(&mut live, preview, &snapshot)
+            };
+            if preview.is_current_buffer(snapshot.revision) {
+                match result {
+                    Ok(status) => println!("QLIVE_EDITOR_STATUS {}", serde_json::json!({"revision": snapshot.revision, "status": status})),
+                    Err(error) => eprintln!("qlive: unsaved buffers retained: {error}"),
+                }
+            }
         }
         files = watched_files(&live.chain);
         watch_dirs(&mut watcher, &files, &mut watched_dirs)?;
@@ -412,9 +446,21 @@ fn watch(mut live: Live, preview: &Preview, buffers: Option<std::sync::mpsc::Rec
 }
 
 /// Render unsaved prose, retaining outputs only if every executable cell is unchanged.
-fn on_buffer(live: &mut Live, preview: &Preview, text: &str, revision: u64) -> Result<String> {
+fn on_buffer(live: &mut Live, preview: &Preview, snapshot: &qlive_server::editor::BufferSnapshot) -> Result<String> {
     let started = Instant::now();
-    let expanded = qlive_core::includes::expand(text, live.chain.target())?;
+    let revision = snapshot.revision;
+    if !preview.is_current_buffer(revision) { return Ok("superseded".into()); }
+    let text = snapshot.read(live.chain.target())?;
+    let expanded = qlive_core::includes::expand_with(&text, live.chain.target(), |path| Ok(snapshot.read(path)?))?;
+    if !preview.is_current_buffer(revision) { return Ok("superseded".into()); }
+    for (path, text) in &snapshot.buffers {
+        if frontmatter::split(text).0 != frontmatter::split(&std::fs::read_to_string(path)?).0 {
+            return Err(anyhow!("Save changed front matter in {} to rebuild the page", path.display()));
+        }
+    }
+    if source_metadata(&expanded)? != live.cold.source_metadata {
+        return Err(anyhow!("Save to rebuild metadata from changed includes"));
+    }
     let (front, body) = frontmatter::split(&expanded.text);
     if front.map(str::to_string) != live.cold.front_matter {
         return Err(anyhow!("Save to rebuild changed front matter"));
@@ -435,7 +481,7 @@ fn on_buffer(live: &mut Live, preview: &Preview, text: &str, revision: u64) -> R
                 if let Some(patch) = live.incremental.as_mut().unwrap().replace(change, &rendered.out) {
                     // Cell IDs are unchanged by this paragraph patch; only source lines
                     // may have moved. Refresh locations without reparsing the whole DOM.
-                    publish_sources(&expanded, preview, source_locations(&expanded));
+                    publish_sources(&expanded, preview, source_locations(&expanded), Some(revision));
                     let html = &live.incremental.as_ref().unwrap().html;
                     preview.set_page(live.cold.shell.page(&html));
                     preview.send_block(&id, &patch);
@@ -471,7 +517,7 @@ fn on_buffer(live: &mut Live, preview: &Preview, text: &str, revision: u64) -> R
     let html = qlive_quarto::postprocess::process(&rendered.out, &live.cold.postprocess);
     let html = shell::version_images(&html, live.chain.target().parent().unwrap());
     if !preview.is_current_buffer(revision) { return Ok("superseded".into()); }
-    let html = map_sources(&html, &expanded, preview, false);
+    let html = map_sources(&html, &expanded, preview, false, Some(revision));
     let html = prepare_incremental(&mut live.incremental, &expanded.text, &html, &live.cold.capture.env);
     preview.set_page(live.cold.shell.page(&html));
     preview.send_body(&html);
@@ -479,15 +525,28 @@ fn on_buffer(live: &mut Live, preview: &Preview, text: &str, revision: u64) -> R
     Ok("updated".into())
 }
 
+fn can_publish(preview: &Preview, publish: bool, revision: Option<u64>) -> bool {
+    publish && revision.is_none_or(|revision| preview.is_current_buffer(revision))
+}
+
+fn source_metadata(expanded: &qlive_core::includes::Expanded) -> Result<Vec<(PathBuf, String)>> {
+    let mut metadata = Vec::new();
+    for file in &expanded.files {
+        let source = std::fs::read_to_string(file)?;
+        if let Some(front) = frontmatter::split(&source).0 { metadata.push((file.clone(), front.to_owned())); }
+    }
+    Ok(metadata)
+}
+
 fn prepare_incremental(document: &mut Option<qlive_quarto::incremental::Document>, source: &str, html: &str, env: &[(String, String)]) -> String {
     *document = if qlive_quarto::incremental::allowed(env) { qlive_quarto::incremental::Document::prepare(source, html) } else { None };
     document.as_ref().map(|d| d.html.clone()).unwrap_or_else(|| html.to_owned())
 }
 
-fn map_sources(html: &str, expanded: &qlive_core::includes::Expanded, preview: &Preview, page: bool) -> String {
+fn map_sources(html: &str, expanded: &qlive_core::includes::Expanded, preview: &Preview, page: bool, revision: Option<u64>) -> String {
     let sources = source_locations(expanded);
     let (html, mapped) = if sources.is_empty() { (html.to_owned(), true) } else { qlive_quarto::sourcemap::annotate(html, sources.len(), page) };
-    publish_sources(expanded, preview, if mapped { sources } else { Vec::new() });
+    publish_sources(expanded, preview, if mapped { sources } else { Vec::new() }, revision);
     html
 }
 
@@ -504,10 +563,10 @@ fn source_locations(expanded: &qlive_core::includes::Expanded) -> Vec<serde_json
     visible.unwrap_or_default()
 }
 
-fn publish_sources(expanded: &qlive_core::includes::Expanded, preview: &Preview, sources: Vec<serde_json::Value>) {
+fn publish_sources(expanded: &qlive_core::includes::Expanded, preview: &Preview, sources: Vec<serde_json::Value>, revision: Option<u64>) {
     preview.set_sources(sources, serde_json::json!({
         "root": expanded.files.first(), "files": expanded.files, "edges": expanded.edges,
-    }));
+    }), revision);
 }
 
 /// Every file the preview depends on: the chain's documents and what they include.

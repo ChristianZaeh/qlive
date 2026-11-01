@@ -5,6 +5,7 @@ const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 let session;
 let sourcesView;
+let extensionState;
 const fileKey = file => process.platform === 'win32' ? file.toLowerCase().replace(/\\/g, '/') : file;
 
 class SourcesView {
@@ -97,10 +98,30 @@ function showPreview(s) {
     { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
     { enableScripts: true, retainContextWhenHidden: true,
       portMapping: [{ webviewPort: s.port, extensionHostPort: s.port }] });
+  const nonce = crypto.randomBytes(16).toString('hex');
   panel.webview.html = `<!doctype html><html><head>
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src http://127.0.0.1:${s.port}; style-src 'unsafe-inline'">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src http://127.0.0.1:${s.port}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'">
     <style>html,body,iframe{width:100%;height:100%;margin:0;padding:0;border:0;overflow:hidden}body{background:white}</style>
-    </head><body><iframe title="Quarto live preview" src="http://127.0.0.1:${s.port}/"></iframe></body></html>`;
+    </head><body><iframe id="preview" title="Quarto live preview" src="http://127.0.0.1:${s.port}/?qlive-view=${s.viewMode}"></iframe>
+    <script nonce="${nonce}">
+      const vscode = acquireVsCodeApi();
+      const frame = document.getElementById('preview');
+      let mode = '${s.viewMode}';
+      frame.addEventListener('load', () => frame.contentWindow.postMessage({type:'qlive-view',mode}, '*'));
+      window.addEventListener('message', event => {
+        if (event.source === frame.contentWindow && event.data?.type === 'qlive-view-changed') {
+          if (event.data.mode === 'paper' || event.data.mode === 'web') { mode = event.data.mode; vscode.postMessage({type:'view-mode',mode}); }
+        } else if (event.data?.type === 'view-mode' && (event.data.mode === 'paper' || event.data.mode === 'web')) {
+          mode = event.data.mode; frame.contentWindow.postMessage({type:'qlive-view',mode}, '*');
+        }
+      });
+    </script></body></html>`;
+  panel.webview.onDidReceiveMessage(message => {
+    if (message.type === 'view-mode' && (message.mode === 'web' || message.mode === 'paper')) {
+      s.viewMode = message.mode;
+      void extensionState.update('qlive.viewMode', s.viewMode);
+    }
+  });
   panel.onDidDispose(() => {
     s.panel = undefined;
     if (session === s) stop();
@@ -118,9 +139,9 @@ function freePort() {
   });
 }
 
-function sendBuffer(s, text) {
+function sendBuffer(s, buffer) {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ path: s.doc.uri.fsPath, text });
+    const body = JSON.stringify(buffer);
     const request = http.request({ hostname: '127.0.0.1', port: s.port, path: '/qlive/buffer', method: 'POST',
       headers: { authorization: `Bearer ${s.token}`, 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, response => {
       let data = '';
@@ -156,15 +177,19 @@ function stop() {
 }
 
 async function flush(s) {
-  if (session !== s || !s.ready || s.sending || s.pending === undefined) return;
-  const text = s.pending;
-  s.pending = undefined;
+  if (session !== s || !s.ready || s.sending || s.pending.size === 0) return;
+  const [key, buffer] = s.pending.entries().next().value;
+  s.pending.delete(key);
+  if (!s.files.has(key)) { if (s.pending.size) void flush(s); return; }
   s.sending = true;
+  s.sent.set(key, buffer.version + ':' + buffer.dirty);
   try {
-    const result = await sendBuffer(s, text);
+    const result = await sendBuffer(s, buffer);
     if (session !== s) return;
-    s.status.text = result.code === 200 ? '$(check) qlive: Live' : '$(info) qlive: Save needed';
-    s.status.tooltip = result.message || 'Unsaved prose is live. Save to execute changed code or rebuild metadata.';
+    if (result.code === 200 || result.revision > (s.savedRevision || 0)) {
+      s.status.text = result.code === 200 ? '$(check) qlive: Live' : '$(info) qlive: Save needed';
+      s.status.tooltip = result.message || 'Unsaved prose is live. Save to execute changed code or rebuild metadata.';
+    }
     if (result.code !== 200) s.output.appendLine(result.message || `HTTP ${result.code}`);
   } catch (error) {
     if (session === s) {
@@ -174,20 +199,21 @@ async function flush(s) {
     }
   } finally {
     s.sending = false;
-    if (session === s && s.pending !== undefined) void flush(s);
+    if (session === s && s.pending.size) void flush(s);
   }
 }
 
-function schedule(doc) {
+function schedule(doc, dirty = doc.isDirty) {
   const s = session;
-  if (!s || doc.uri.toString() !== s.doc.uri.toString()) return;
-  s.pending = doc.getText();
+  if (!s || doc.uri.scheme !== 'file' || !s.files.has(fileKey(doc.uri.fsPath))) return;
+  s.pending.set(fileKey(doc.uri.fsPath), { path: doc.uri.fsPath, text: dirty ? doc.getText() : '', dirty, version: doc.version });
   clearTimeout(s.timer);
   const delay = vscode.workspace.getConfiguration('qlive', doc.uri).get('debounceMs', 100);
   s.timer = setTimeout(() => void flush(s), delay);
 }
 
 function activate(context) {
+  extensionState = context.globalState;
   sourcesView = new SourcesView();
   context.subscriptions.push(sourcesView.changed, vscode.window.registerTreeDataProvider('qlive.includes', sourcesView));
   const quarto = vscode.extensions.getExtension('quarto.quarto');
@@ -201,7 +227,7 @@ function activate(context) {
       return vscode.window.showErrorMessage('Open a saved .qmd or .md file first.');
     }
     if (!vscode.workspace.isTrusted) return;
-    if (session?.doc.uri.toString() === doc.uri.toString()) {
+    if (session?.files.has(fileKey(doc.uri.fsPath))) {
       schedule(doc);
       showPreview(session);
       return;
@@ -219,8 +245,9 @@ function activate(context) {
       status.command = 'qlive.open';
       status.text = '$(sync~spin) qlive: Starting';
       status.show();
-      const s = session = { doc, child, port, token, status, output, pending: doc.getText(), ready: false,
-        files: new Set([fileKey(doc.uri.fsPath)]), lines: '' };
+      const s = session = { doc, child, port, token, status, output, pending: new Map(), sent: new Map(), ready: false,
+        files: new Set([fileKey(doc.uri.fsPath)]), lines: '', viewMode: extensionState.get('qlive.viewMode', 'web') === 'paper' ? 'paper' : 'web' };
+      schedule(doc);
       void vscode.commands.executeCommand('setContext', 'qlive.previewRunning', true);
       let startup = '';
       child.stdout.on('data', chunk => {
@@ -234,9 +261,21 @@ function activate(context) {
             if (line.startsWith('QLIVE_SOURCES ')) {
               const manifest = JSON.parse(line.slice('QLIVE_SOURCES '.length));
               s.files = new Set(manifest.files.map(fileKey));
-              if (session === s) sourcesView.update(s, manifest);
+              for (const key of s.sent.keys()) if (!s.files.has(key)) s.sent.delete(key);
+              for (const key of s.pending.keys()) if (!s.files.has(key)) s.pending.delete(key);
+              if (session === s) {
+                sourcesView.update(s, manifest);
+                for (const open of vscode.workspace.textDocuments) {
+                  if (open.uri.scheme === 'file' && open.isDirty && s.files.has(fileKey(open.uri.fsPath))
+                    && s.sent.get(fileKey(open.uri.fsPath)) !== open.version + ':true') schedule(open);
+                }
+              }
             } else if (line.startsWith('QLIVE_REVEAL ')) {
               void revealSource(s, JSON.parse(line.slice('QLIVE_REVEAL '.length))).catch(error => output.appendLine(error.message));
+            } else if (line.startsWith('QLIVE_EDITOR_STATUS ') && session === s) {
+              const saved = JSON.parse(line.slice('QLIVE_EDITOR_STATUS '.length));
+              s.savedRevision = Math.max(s.savedRevision || 0, saved.revision);
+              if (!s.pending.size) { s.status.text = '$(check) qlive: Live'; s.status.tooltip = saved.status; }
             }
           } catch (error) { output.appendLine(`Source mapping: ${error.message}`); }
         }
@@ -260,6 +299,12 @@ function activate(context) {
     } catch (error) { void vscode.window.showErrorMessage(`Cannot start qlive: ${error.message}`); }
   }));
   context.subscriptions.push(vscode.commands.registerCommand('qlive.stop', stop));
+  context.subscriptions.push(vscode.commands.registerCommand('qlive.togglePaperView', () => {
+    if (!session) return;
+    session.viewMode = session.viewMode === 'paper' ? 'web' : 'paper';
+    void extensionState.update('qlive.viewMode', session.viewMode);
+    session.panel?.webview.postMessage({type: 'view-mode', mode: session.viewMode});
+  }));
   context.subscriptions.push(vscode.commands.registerCommand('qlive.revealSource', source => session && revealSource(session, source)));
   const command = (name, action) => context.subscriptions.push(vscode.commands.registerCommand(name, async () => {
     try { await action(); } catch (error) { void vscode.window.showErrorMessage(`qlive: ${error.message}`); }
@@ -286,15 +331,16 @@ function activate(context) {
     if (session) showPreview(session);
   }));
   context.subscriptions.push(vscode.commands.registerCommand('qlive.openExternal', () => {
-    if (session?.ready) return vscode.env.openExternal(vscode.Uri.parse(`http://127.0.0.1:${session.port}/`));
+    if (session?.ready) return vscode.env.openExternal(vscode.Uri.parse(`http://127.0.0.1:${session.port}/?qlive-view=${session.viewMode}`));
   }));
   context.subscriptions.push(vscode.commands.registerCommand('qlive.refresh', () => {
     if (session) schedule(session.doc);
   }));
   context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(event => schedule(event.document)));
-  context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(schedule));
+  context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(doc => schedule(doc, false)));
   context.subscriptions.push(vscode.workspace.onDidCloseTextDocument(doc => {
     if (session?.doc.uri.toString() === doc.uri.toString()) stop();
+    else schedule(doc, false);
   }));
   context.subscriptions.push({ dispose: stop });
 }

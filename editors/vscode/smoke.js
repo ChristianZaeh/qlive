@@ -47,9 +47,9 @@ async function main() {
     } else child.kill();
     await done;
   };
-  const post = (text, auth = token, file = doc) => fetch(`${url}/qlive/buffer`, {
+  const post = (text, auth = token, file = doc, dirty = true) => fetch(`${url}/qlive/buffer`, {
     method: 'POST', headers: { authorization: `Bearer ${auth}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ path: file, text }), signal: AbortSignal.timeout(35000)
+    body: JSON.stringify({ path: file, text, dirty }), signal: AbortSignal.timeout(35000)
   });
   try {
     launch();
@@ -79,20 +79,24 @@ async function main() {
     assert.equal((await post(source.replace('x = 2', 'x = 3'))).status, 409);
     const broken = source.replace('x = 2', 'x = 1 / 0').replace('unrelated working', 'unrelated still working');
     await fs.writeFile(doc, broken);
+    assert.ok([200, 409].includes((await post(broken, token, doc, false)).status));
     await waitFor(async () => (await (await fetch(url)).text()).includes('unrelated still working'));
     const html = await (await fetch(url)).text();
     assert.match(html, /ZeroDivisionError/);
     assert.match(html, /DependencyError/);
     assert.doesNotMatch(html, /dependent 3/);
     await fs.writeFile(doc, broken.replace('x = 1 / 0', 'x = 10'));
+    assert.ok([200, 409].includes((await post('', token, doc, false)).status));
     await waitFor(async () => (await (await fetch(url)).text()).includes('dependent 11'));
     await stop();
     const chapters = path.join(root, 'chapters');
     await fs.mkdir(chapters);
     const one = path.join(chapters, 'one.qmd');
     const two = path.join(chapters, 'two.qmd');
-    await fs.writeFile(one, '## Chapter\n\n```{python}\nx = 42\n```\n\n{{< include chapters/two.qmd >}}\n');
-    await fs.writeFile(two, '## Nested\n\n```{python}\nprint("nested result", x)\n```\n');
+    const originalOne = '## Chapter\n\nSAVED ONE PROSE\n\n```{python}\nx = 42\n```\n\n{{< include chapters/two.qmd >}}\n';
+    const originalTwo = '## Nested\n\nSAVED TWO PROSE\n\n```{python}\nprint("nested result", x)\n```\n';
+    await fs.writeFile(one, originalOne);
+    await fs.writeFile(two, originalTwo);
     await fs.writeFile(doc, '---\ntitle: Master\n---\n\n{{< include chapters/one.qmd >}}\n');
     launch();
     await waitFor(() => logs.includes(url));
@@ -107,10 +111,47 @@ async function main() {
     await waitFor(() => logs.includes('QLIVE_REVEAL '));
     const location = JSON.parse(logs.split('\n').find(line => line.startsWith('QLIVE_REVEAL ')).slice('QLIVE_REVEAL '.length));
     assert.equal(location.file, two);
-    assert.equal(location.line, 3);
+    assert.equal(location.line, 5);
     assert.equal((await fetch(`${url}/qlive/reveal`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 99 }) })).status, 404);
+    assert.equal((await post(originalOne.replace('SAVED ONE', 'UNSAVED ONE'), token, one)).status, 200);
+    assert.equal((await post(originalTwo.replace('SAVED TWO', 'UNSAVED TWO'), token, two)).status, 200);
+    let merged = await (await fetch(url)).text();
+    assert.ok(merged.includes('UNSAVED ONE') && merged.includes('UNSAVED TWO'));
+    assert.equal(await fs.readFile(one, 'utf8'), originalOne);
+    assert.equal(await fs.readFile(two, 'utf8'), originalTwo);
+    assert.equal((await post('---\nfig-width: 12\n---\n' + originalTwo, token, two)).status, 409);
+    assert.equal((await post(originalTwo.replace('SAVED TWO', 'UNSAVED TWO'), token, two)).status, 200);
+    const concurrent = await Promise.all([
+      post(originalOne.replace('SAVED ONE', 'CONCURRENT ONE'), token, one),
+      post(originalTwo.replace('SAVED TWO', 'CONCURRENT TWO'), token, two)
+    ]);
+    assert.ok(concurrent.every(response => response.status === 200));
+    merged = await (await fetch(url)).text();
+    assert.ok(merged.includes('CONCURRENT ONE') && merged.includes('CONCURRENT TWO'));
+    const third = path.join(chapters, 'three.qmd');
+    await fs.writeFile(third, 'SAVED THIRD PROSE\n');
+    assert.equal((await post('Not included yet', token, third)).status, 403);
+    const withThird = originalOne.replace('SAVED ONE', 'CONCURRENT ONE') + '\n{{< include chapters/three.qmd >}}\n';
+    assert.equal((await post(withThird, token, one)).status, 200);
+    assert.equal((await post('UNSAVED THIRD PROSE\n', token, third)).status, 200);
+    assert.match(await (await fetch(url)).text(), /UNSAVED THIRD PROSE/);
+    assert.equal((await post(originalOne.replace('SAVED ONE', 'CONCURRENT ONE'), token, one)).status, 200);
+    assert.equal((await post('Detached file', token, third)).status, 403);
+    assert.equal(await fs.readFile(third, 'utf8'), 'SAVED THIRD PROSE\n');
+    // Saving a code change in one chapter must keep the other chapter's unsaved prose.
+    const savedOne = originalOne.replace('SAVED ONE', 'SAVED UPDATED ONE').replace('x = 42', 'x = 84');
+    await fs.writeFile(one, savedOne);
+    assert.ok([200, 409].includes((await post('', token, one, false)).status));
+    await waitFor(async () => (await (await fetch(url)).text()).includes('nested result 84'));
+    merged = await (await fetch(url)).text();
+    assert.ok(merged.includes('SAVED UPDATED ONE') && merged.includes('CONCURRENT TWO'));
+    assert.equal(await fs.readFile(two, 'utf8'), originalTwo);
+    assert.equal((await post('', token, two, false)).status, 200);
+    merged = await (await fetch(url)).text();
+    assert.ok(merged.includes('SAVED TWO') && !merged.includes('CONCURRENT TWO'));
     console.log('PASS: unsaved buffers, disk preservation, auth, target restriction, coalescing, cached cell outputs, isolated failure, blocked dependents, recovery');
     console.log('PASS: nested include tree and source IDs resolve to the producing chapter and line');
+    console.log('PASS: multiple unsaved chapters, concurrent snapshots, changing include scope, saved code changes retain other overlays, discard');
   } catch (error) { console.error(logs); throw error; }
   finally { await stop(); }
 }

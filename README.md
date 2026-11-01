@@ -102,7 +102,11 @@ For **preview while typing without saving**, install the local
 It streams the active document's buffer to a token-authenticated loopback endpoint,
 debounces edits by 100 ms, and patches the preview using the warm pipeline. Prose
 edits reuse existing cell outputs. Code and front-matter changes require a save.
-Only the preview's source document is streamed; included files still come from disk.
+The master and its included documents stream unsaved buffers into one preview.
+Saving one chapter preserves unsaved prose in the others; closing/discarding an
+included buffer returns to its saved contents. Changed code and front matter still
+require saving. A Paper/Web toggle changes the preview's appearance without
+restarting the kernel; Paper view is a continuous page approximation, not exact PDF pagination.
 This is the initial M3 path, with no claim yet of sub-50-ms keystroke latency.
 
 The **Quarto Sources** tree shows nested includes. Clicking a rendered cell output
@@ -480,7 +484,7 @@ semantics, which regexes cannot give faithfully. Porting them onto a real DOM, i
 order of the table, is M7.
 | **M1** | `pandoc lua` worker, whole-document warm passes | **done**: Quarto's own pipeline warm, 78 ms for 283 lines, parity verified |
 | **M2** | warm renders patched into the page, no reload | **done for documents without code cells**: 25–35 ms per save on a small document, ~80 ms expected on a chapter; block-level patching and a 50-doc parity corpus remain |
-| **M3** | VS Code buffer streaming, no save needed | initial prose path implemented; includes overlays and sub-50-ms p95 gate remain open |
+| **M3** | VS Code buffer streaming, no save needed | master/include prose buffers and paragraph patches implemented; sub-50-ms keystroke-to-paint p95 gate remains open |
 | **M4** | typst as a library, per-page SVG patches | under 30 ms per edit |
 | **M5** | Jupyter kernel pool + per-chunk cache | prose edit = 0 executions |
 

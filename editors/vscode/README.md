@@ -13,18 +13,26 @@ Set `qlive.executable` to the built qlive binary (for this checkout,
 Quarto and the usual qlive dependencies must be available. The extension requires
 a trusted workspace and has no npm runtime dependencies.
 
-The first version streams the document used to start the preview. Included files
-are read from disk; unsaved changes in other tabs are not streamed into the master.
-Prose edits reuse existing cell outputs. Save to execute changed code cells, rebuild
-front matter, or render documents without a working warm pipeline. Closing the
-source tab or the extension stops the daemon. qlive never saves the editor buffer.
+The master and its included files stream unsaved buffers into one preview. Changes
+in multiple open chapters are combined; saving one chapter retains the others'
+unsaved prose. Discarding/closing an included buffer returns it to the saved source.
+Preview from an included chapter reuses the master's session. Prose edits reuse
+existing cell outputs. Save to execute changed code cells, rebuild front matter, or
+render documents without a working warm pipeline. Closing the master tab or the
+extension stops the daemon. qlive never saves the editor buffer.
+
+Use **qlive: Toggle Paper/Web View**, the panel's book icon, or the in-page toggle
+to change appearance without reloading or restarting the kernel. Paper view uses a
+continuous A4-width sheet, serif text and paper margins. It approximates PDF
+appearance; it does not reproduce the PDF engine's exact pagination. The choice is
+remembered, and opening the external browser carries over the selected mode.
 
 Failed cells display errors; their dependent cells are blocked, and unrelated cells
 continue. Dependencies use Python name analysis with qlive's documented limits;
 an unparseable cell conservatively blocks later cells.
 
 Build and install the local VSIX with `python editors/vscode/package.py`, then
-`code --install-extension editors/vscode/qlive-preview-0.3.0.vsix --force`.
+`code --install-extension editors/vscode/qlive-preview-0.4.0.vsix --force`.
 
 To route the installed Quarto extension's existing Preview menus and shortcut into
 qlive, run `python editors/vscode/integrate_quarto.py <installed-quarto-extension-dir>`

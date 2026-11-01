@@ -9,11 +9,12 @@ cells still run in a Python kernel.
 |---|---|---|
 | Existing Preview button and Ctrl/Cmd+Shift+K | Implemented through reversible local manifest integration | Verified by clicking the original button and invoking the shortcut in VS Code |
 | Side-by-side preview, refresh, browser, stop | Implemented | Verified panel rendering, unsaved prose, unchanged disk source and daemon stop |
-| Unsaved source document | Implemented for prose; saved code outputs reused | Stream unsaved included chapters; keep the latest accepted buffer visible |
+| Unsaved source documents | Master and included chapter overlays implemented; saved code outputs reused | Broader keystroke-to-paint latency measurements |
 | Cell execution and error isolation | Rust planner/kernel orchestration implemented on save | Editor commands for current/above/below cells and explicit execution |
 | Insert cell, navigate cells | Rust source-range queries and editor commands implemented | Broader authoring parity fixtures |
 | New document/project/presentation, convert, render formats/projects | New-document template implemented in Rust; other Quarto commands remain available | Rust commands delegating cold work to Quarto CLI |
-| Nested files and output-to-source | Include tree and mapped cell output navigation implemented | Final interactive cursor-jump verification; unsaved included buffers |
+| Nested files and output-to-source | Include tree, chapter buffers and mapped cell output navigation implemented | Final interactive cursor-jump verification |
+| Paper/Web toggle | Continuous paper appearance implemented without daemon restart | Detect PDF metadata for closer styling; exact pagination remains M4 |
 | Paragraph updates | Conservative block rendering and patch transport implemented | Broader eligible subset and keystroke-to-paint latency gate |
 | Syntax, outline, completions, diagnostics, formatting, assist | Original Quarto extension remains the provider | Specify and implement a Rust language service; preserve existing authoring behavior |
 | Visual editor, citations/Zotero, math/diagram previews | Original Quarto extension remains the provider | Separate feature ports and UI parity fixtures |

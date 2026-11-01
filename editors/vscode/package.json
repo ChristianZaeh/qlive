@@ -2,7 +2,7 @@
   "name": "qlive-preview",
   "displayName": "qlive Preview",
   "description": "Quarto preview from unsaved editor buffers",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "qlive-local",
   "engines": { "vscode": "^1.85.0" },
   "main": "./extension.js",
@@ -15,6 +15,7 @@
       { "command": "qlive.open", "title": "Show Preview", "category": "qlive", "icon": "$(preview)" },
       { "command": "qlive.openExternal", "title": "Open Preview in Browser", "category": "qlive", "icon": "$(link-external)" },
       { "command": "qlive.refresh", "title": "Refresh Preview", "category": "qlive", "icon": "$(refresh)" },
+      { "command": "qlive.togglePaperView", "title": "Toggle Paper/Web View", "category": "qlive", "icon": "$(book)" },
       { "command": "qlive.revealSource", "title": "Go to Source", "category": "qlive" },
       { "command": "qlive.insertCodeCell", "title": "Insert Code Cell", "category": "qlive" },
       { "command": "qlive.goToNextCell", "title": "Go to Next Cell", "category": "qlive" },
@@ -32,6 +33,7 @@
       "editor/title": [
         { "command": "qlive.start", "when": "!qlive.quartoPreviewIntegrated && resourceScheme == file && (resourceExtname == .qmd || resourceExtname == .md)", "group": "navigation@1" },
         { "command": "qlive.refresh", "when": "activeWebviewPanelId == qlive.preview", "group": "navigation@1" },
+        { "command": "qlive.togglePaperView", "when": "activeWebviewPanelId == qlive.preview", "group": "navigation@2" },
         { "command": "qlive.openExternal", "when": "activeWebviewPanelId == qlive.preview", "group": "navigation@2" },
         { "command": "qlive.stop", "when": "activeWebviewPanelId == qlive.preview", "group": "navigation@3" }
       ],
