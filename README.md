@@ -14,16 +14,20 @@ Windows 11, 283-line document):
 
 | path | cost |
 |---|---:|
-| `quarto preview` save → browser reload | 3300 ms |
-| `quarto render --to pdf` (MiKTeX lualatex) | 12000 ms |
-| `pandoc.exe` one-shot | 550 ms |
-| warm pandoc, whole document | ~120 ms |
-| warm pandoc, **one block** | **3.9 ms** |
-| `pandoc server` HTTP, one block | 6–9 ms |
-| `typst watch` incremental rebuild | **8–11 ms** |
+| `quarto preview` save → browser reload | 1040 ms |
+| `quarto render --to html` one shot | 1906 ms |
+| `pandoc.exe` one-shot | 74 ms |
+| warm pandoc, whole document | ~16 ms |
+| warm pandoc, **one block** | **0.52 ms** |
+| `pandoc server` HTTP, one block | 1.2 ms |
+| `typst watch` rebuild, as typst reports it | **3.1 ms** |
+| any Python cell, on top of the above | +4300 ms |
 
-Roughly a second of every Quarto save is Deno process startup; the actual rendering of
-a mid-size document is ~120 ms, and a single block is ~4 ms. That gap is the project.
+Almost all of every Quarto save is process startup and pipeline setup; the actual
+rendering of a mid-size document is ~16 ms, and a single block is half a millisecond.
+That gap — roughly 2000× — is the project. A document with Python cells is a separate
+problem: a flat ~4.3 s of jupyter engine regardless of what the cells do, which is
+what the kernel pool in M5 addresses.
 
 `qlive bench` reproduces this table wherever it runs, so the premise stays a claim you
 can check rather than one you have to trust.
@@ -35,28 +39,30 @@ nothing about either tool.
 
 ### M0 result
 
-`qlive bench`, 283-line fixture, 121 blocks, 20 warm iterations — on a machine that
-was *not* idle, so the cold `quarto render` figure is inflated:
+`qlive bench`, 283-line fixture, 121 blocks, 20 warm iterations, **idle machine**:
 
 | step | ms |
 |---|---:|
-| quarto render --to html (cold, Deno included) | 14270.5 |
-| pandoc one-shot, whole doc (process start) | 565.0 |
-| pandoc server, whole doc | 209.0 |
-| pandoc server, one block | **10.9** |
-| typst compile, one-shot (process start) | 493.3 |
-| typst watch, edit -> new PDF (end to end) | 169.1 |
-| &nbsp;&nbsp;of which typst reports as compile | **10.9** |
+| quarto render --to html (cold, Deno included) | 1905.8 |
+| pandoc one-shot, whole doc (process start) | 74.1 |
+| pandoc server, whole doc | 23.5 |
+| pandoc server, one block | **1.2** |
+| typst compile, one-shot (process start) | 253.0 |
+| typst watch, edit -> new PDF (end to end) | 132.5 |
+| &nbsp;&nbsp;of which typst reports as compile | **3.1** |
 
 > A one-word edit dirties 1 of 121 blocks.
 
 That last line is the premise, now measured rather than asserted: the hot path has one
-block to re-render, at ~11 ms, in place of the cold render it replaces. The ~170 ms
-end-to-end against typst's own 10.9 ms is file-watch latency, which is exactly the
-argument for M4 using typst as a library instead of a subprocess.
+block to re-render, at ~1 ms, in place of the ~1.9 s cold render it replaces. The
+132 ms end-to-end against typst's own 3.1 ms is file-watch latency, which is exactly
+the argument for M4 using typst as a library instead of a subprocess.
 
-Across three consecutive runs the two headline rows came out at 4.9–9.3 ms (one block)
-and 120–194 ms (typst end to end).
+For scale, `quarto preview` save → browser reload on the same idle machine is
+**1040 ms** (1046 / 1038 / 1042 over three edits). That is the number to beat.
+
+The same bench on a machine running a game gave 14270 ms for the cold render and
+4.9–10.9 ms per block — 3–7× worse throughout. The ratios survived; nothing else did.
 
 One finding worth keeping: **`typst watch` sometimes misses an edit outright.** Twice
 in four runs the process stayed alive, its last line a successful startup compile, and
